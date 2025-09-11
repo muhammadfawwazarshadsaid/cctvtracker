@@ -1,5 +1,5 @@
 # Step 1: Build
-FROM golang:1.22 AS builder
+FROM golang:1.23 AS builder
 WORKDIR /app
 
 # Copy mod files and download deps
@@ -19,10 +19,7 @@ WORKDIR /app
 # Copy binary
 COPY --from=builder /app/app .
 
-# Copy .env kalau mau (opsional)
-# COPY .env .env
-
-# Expose Render's dynamic port
+# Expose Render’s dynamic port
 EXPOSE 3000
 
 CMD ["./app"]
