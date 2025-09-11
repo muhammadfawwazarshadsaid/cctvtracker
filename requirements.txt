@@ -1,0 +1,40 @@
+# Base
+ultralytics
+opencv-python
+numpy
+pillow
+tqdm
+pandas
+scikit-learn
+
+# Tracking
+deep-sort-realtime==1.3.2
+
+# Torch / Vision (CPU wheels; jika punya CUDA, install sesuai sistem sendiri)
+torch
+torchvision
+
+# ReID
+torchreid==0.2.5
+
+# Face recognition (InsightFace)
+insightface
+# Gunakan salah satu runtime berikut (pilih sesuai mesin):
+onnxruntime
+# on Apple Silicon (M1/M2/M3): ganti dengan baris di bawah dan hapus 'onnxruntime' biasa
+# onnxruntime-silicon
+
+# Gemini
+google-generativeai
+
+# TorchReID import deps (diperlukan saat import)
+gdown
+yacs
+pyyaml
+prettytable
+tabulate
+tensorboard
+
+# (opsional/umum)
+# protobuf<4
+# cython
