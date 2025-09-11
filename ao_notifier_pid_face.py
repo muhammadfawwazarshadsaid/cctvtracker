@@ -1,13 +1,19 @@
 # ao_notifier_pid_face.py (DeepSORT embedder = torchreid + OSNet)
+
 import os
 import cv2
 import time
 import json
 import argparse
+import base64
 from datetime import datetime
 from typing import Optional, Tuple, Dict
+from datetime import datetime, timezone
+
+ts = datetime.now(timezone.utc).isoformat()
 
 import numpy as np
+import requests
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
@@ -67,9 +73,85 @@ def parse_args():
     ap.add_argument("--reid_max_age", type=int, default=40, help="DeepSORT max_age (ketahanan track)")
     ap.add_argument("--reid_max_cos", type=float, default=0.20, help="DeepSORT max_cosine_distance (ketat=lebih kecil)")
     ap.add_argument("--reid_nn_budget", type=int, default=100, help="DeepSORT nn_budget (gallery size)")
+    ap.add_argument("--backend_url", type=str, default=os.getenv("BACKEND_URL", "http://localhost:3000/notify"),
+                    help="URL backend Go untuk menerima notify event")
 
     return ap.parse_args()
 
+def send_to_backend(args, owner_pid, owner_name, item_name, event_type, frame_path, crop_path, message=""):
+    payload = {
+        "group_key": f"ownerPID{owner_pid}_item{item_name or 'unknown'}",
+        "owner_pid": owner_pid,
+        "owner_name": owner_name,
+        "item_name": item_name,
+        "snapshot": {
+            "type": event_type,
+            "ts": datetime.utcnow().isoformat(),
+            "frame_path": frame_path,
+            "crop_path": crop_path,
+            "message": message
+        }
+    }
+    try:
+        r = requests.post(args.backend_url, json=payload, timeout=5)
+        if r.status_code >= 300:
+            print(f"[BACKEND] gagal kirim ({r.status_code}): {r.text}")
+        else:
+            print(f"[BACKEND] event {event_type} terkirim → {r.json()}")
+    except Exception as e:
+        print(f"[BACKEND-ERROR] {e}")
+
+BACKEND_URL = os.getenv("BACKEND_URL") or "http://localhost:3000/notify"
+
+def image_to_base64(path: str) -> Optional[str]:
+    """Membaca file gambar dan meng-encode ke base64 string."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode('utf-8')
+    except Exception as e:
+        print(f"[ERROR] Gagal encode base64 untuk {path}: {e}")
+        return None
+def notify_backend(
+    group_key,
+    owner_pid,
+    owner_name,
+    item_name,
+    snap_type,
+    frame_path=None,  # Path masih diterima sebagai input
+    crop_path=None,   # Path masih diterima sebagai input
+    message=None,
+    location=None,
+    meta=None,
+):
+    # UBAH DI SINI: Baca file dan encode ke base64
+    frame_data_b64 = image_to_base64(frame_path)
+    crop_data_b64 = image_to_base64(crop_path)
+
+    payload = {
+        "group_key": group_key,
+        "owner_pid": owner_pid,
+        "owner_name": owner_name,
+        "item_name": item_name,
+        "location": location,
+        "snapshot": {
+            "type": snap_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "frame_data": frame_data_b64,  # Kirim data base64
+            "crop_data": crop_data_b64,   # Kirim data base64
+            "message": message,
+            "meta": meta or {},
+        },
+    }
+
+    try:
+        r = requests.post(BACKEND_URL, json=payload, timeout=10) # Timeout ditambah
+        print(f"[NOTIFY] {snap_type} -> {r.status_code}")
+        if r.status_code >= 300:
+            print(f"[BACKEND] gagal kirim ({r.status_code}): {r.text}")
+    except Exception as e:
+        print(f"[NOTIFY-ERROR] {e}")
 
 # ---------- Utils ----------
 def is_person(name: str) -> bool:
@@ -594,7 +676,30 @@ def main():
                     "frame": os.path.relpath(un_frame_path, args.out_dir),
                     "crop": os.path.relpath(un_crop_path, args.out_dir)
                 })
+
+                notify_backend(
+                    group_key=pair_key,
+                    owner_pid=st["owner_pid"],
+                    owner_name=st["owner_name"],
+                    item_name=None,
+                    snap_type="attended",
+                    frame_path=att_frame_path,
+                    crop_path=att_crop_path,
+                    message=f"Snapshot attended by {st['owner_name'] or 'Unknown'}"
+                )
                 save_index(index_path, index_db)
+                notify_backend(
+                    group_key=pair_key,
+                    owner_pid=st["owner_pid"],
+                    owner_name=st["owner_name"],
+                    item_name=(gemini_result.get("nama_objek") if gemini_result else None),
+                    snap_type="unattended",
+                    frame_path=os.path.relpath(un_frame_path, args.out_dir),
+                    crop_path=os.path.relpath(un_crop_path, args.out_dir),
+                    message="",
+                    location=None,   # isi kalau ada, mis: "kantin"
+                    meta=None
+                )
 
                 st["snapshot_done"] = True
                 st["attended_first"] = None
