@@ -90,7 +90,12 @@ func main() {
 	mux.HandleFunc("GET /groups/{id}", s.handleGroupDetail)
 	mux.HandleFunc("POST /groups/{id}/resolve", s.handleResolveGroup)
 
-	addr := ":3000"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000" 
+	}
+	addr := ":" + port
+
 	log.Println("listening on", addr)
 	log.Fatal(http.ListenAndServe(addr, logRequest(mux)))
 }
