@@ -63,16 +63,17 @@ type ChatMessage struct {
 }
 
 type CCTVIncident struct {
-	ID               int64     `json:"id"`
-	GroupKey         string    `json:"group_key"`
-	OwnerID          *int64    `json:"owner_id,omitempty"`
-	OwnerName        *string   `json:"owner_name,omitempty"`
-	ItemName         *string   `json:"item_name,omitempty"`
-	Status           string    `json:"status"`
-	LastSnapshotB64  *string   `json:"last_snapshot_b64,omitempty"`
-	LaporanTerkaitID *int64    `json:"laporan_terkait_id,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+    ID                int64     `json:"id"`
+    GroupKey          string    `json:"group_key"`
+    OwnerID           *int64    `json:"owner_id,omitempty"`
+    OwnerName         *string   `json:"owner_name,omitempty"`
+    ItemName          *string   `json:"item_name,omitempty"`
+    LastKnownLocation *string   `json:"last_known_location,omitempty"`
+    Status            string    `json:"status"`
+    LastSnapshotB64   *string   `json:"last_snapshot_b64,omitempty"`
+    LaporanTerkaitID  *int64    `json:"laporan_terkait_id,omitempty"`
+    CreatedAt         time.Time `json:"created_at"`
+    UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type CCTVEvent struct {
@@ -441,15 +442,20 @@ func (s *Server) handleGetIncidentDetail(w http.ResponseWriter, r *http.Request)
 	}
 	ctx := r.Context()
 	var incident CCTVIncident
+    // PERBAIKI QUERY DAN .Scan() DI BAWAH INI
 	err := s.DB.QueryRow(ctx, `
-        SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
+        SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.last_known_location, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
         FROM cctv_incidents i
         LEFT JOIN users u ON i.owner_id = u.id
         WHERE i.id=$1
     `, id).Scan(
-		&incident.ID, &incident.GroupKey, &incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.Status, &incident.CreatedAt, &incident.UpdatedAt, &incident.LastSnapshotB64, &incident.LaporanTerkaitID)
+		&incident.ID, &incident.GroupKey, &incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.LastKnownLocation, &incident.Status, &incident.CreatedAt, &incident.UpdatedAt, &incident.LastSnapshotB64, &incident.LaporanTerkaitID)
 	if err != nil {
-		http.Error(w, "insiden tidak ditemukan: "+err.Error(), 404)
+		if err == pgx.ErrNoRows {
+			http.Error(w, "insiden tidak ditemukan", 404)
+			return
+		}
+		http.Error(w, "gagal mengambil detail insiden: "+err.Error(), 500)
 		return
 	}
 
