@@ -95,6 +95,10 @@ type NotifyPayload struct {
 	Timestamp   time.Time `json:"timestamp"`
 }
 
+type StatusUpdatePayload struct {
+	Status string `json:"status"`
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -140,6 +144,7 @@ func main() {
 	mux.HandleFunc("GET /incidents", s.handleGetIncidents)
 	mux.HandleFunc("GET /incidents/{id}", s.handleGetIncidentDetail)
 	mux.HandleFunc("POST /incidents/{id}/create-report", s.handleCreateReportFromIncident)
+	mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -634,6 +639,57 @@ func (s *Server) handleCreateReportFromIncident(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusCreated, newLaporan)
 }
 
+func (s *Server) handleUpdateIncidentStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+
+	incidentID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if incidentID == 0 {
+		http.Error(w, "ID insiden tidak valid", 400)
+		return
+	}
+
+	var p StatusUpdatePayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Payload tidak valid: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	validStatuses := map[string]bool{
+		"resolved_owner":   true,
+		"resolved_secured": true,
+	}
+	if !validStatuses[p.Status] {
+		http.Error(w, "Nilai status tidak valid", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	cmdTag, err := s.DB.Exec(ctx,
+		"UPDATE cctv_incidents SET status=$1, updated_at=now() WHERE id=$2",
+		p.Status, incidentID,
+	)
+
+	if err != nil {
+		http.Error(w, "Gagal update status: "+err.Error(), 500)
+		return
+	}
+	if cmdTag.RowsAffected() == 0 {
+		http.Error(w, "Insiden tidak ditemukan", 404)
+		return
+	}
+
+	updatedIncident, err := s.fetchIncidentByID(ctx, incidentID)
+	if err != nil {
+		http.Error(w, "Gagal mengambil data terbaru: "+err.Error(), 500)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, updatedIncident)
+}
+
 func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, error) {
 	var l Laporan
 	err := s.DB.QueryRow(ctx, `
@@ -644,6 +700,16 @@ func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, erro
 		return nil, err
 	}
 	return &l, nil
+}
+
+func (s *Server) fetchIncidentByID(ctx context.Context, id int64) (*CCTVIncident, error) {
+	var i CCTVIncident
+	err := s.DB.QueryRow(ctx, "SELECT id, group_key, owner_name, item_name, status, created_at, updated_at, last_snapshot_b64, laporan_terkait_id FROM cctv_incidents WHERE id=$1", id).Scan(
+		&i.ID, &i.GroupKey, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LastSnapshotB64, &i.LaporanTerkaitID)
+	if err != nil {
+		return nil, err
+	}
+	return &i, nil
 }
 
 var reportIDRegex = regexp.MustCompile(`laporan #(\d+)`)
@@ -675,17 +741,20 @@ func nullify(s string) any {
 	}
 	return s
 }
+
 func strFallback(s *string, def string) string {
 	if s == nil || *s == "" {
 		return def
 	}
 	return *s
 }
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
+
 func logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
