@@ -781,6 +781,7 @@ func (s *Server) handleGetDetailLaporan(w http.ResponseWriter, r *http.Request) 
 		"log_aktivitas": chatHistory,
 	})
 }
+// main.go
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	laporanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -790,6 +791,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	
+    // --- LOGIKA BARU DIMULAI DI SINI ---
+    // Cek apakah laporan dengan ID ini sudah ada.
+    var exists bool
+    err := s.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM laporan WHERE id=$1)", laporanID).Scan(&exists)
+    if err != nil {
+        http.Error(w, "gagal cek laporan: "+err.Error(), 500)
+        return
+    }
+
+    // Jika laporan BELUM ADA, buat laporan baru sebagai "wadah" chat.
+    if !exists {
+        // Untuk amannya, kita buat laporan baru dengan ID yang diminta jika memungkinkan
+        // Ini adalah pendekatan sederhana, di produksi mungkin perlu logika berbeda.
+        _, err = s.DB.Exec(ctx, `
+            INSERT INTO laporan (id, jenis_laporan, nama_pelapor, status) 
+            VALUES ($1, 'obrolan', 'Pengguna', 'terbuka')
+            ON CONFLICT (id) DO NOTHING
+        `, laporanID)
+        if err != nil {
+            http.Error(w, "gagal membuat wadah laporan baru: "+err.Error(), 500)
+            return
+        }
+		log.Printf("Membuat wadah laporan baru untuk chat dengan ID: %d", laporanID)
+    }
+    // --- LOGIKA BARU SELESAI ---
+
 	var p ChatPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
@@ -804,7 +832,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if p.ImageB64 != "" {
 		userMessage = strings.TrimSpace(userMessage + " [pengguna melampirkan sebuah gambar]")
 	}
-	_, err := s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
+	_, err = s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
 	if err != nil {
 		http.Error(w, "gagal simpan pesan user: "+err.Error(), 500)
 		return
@@ -831,7 +859,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var newAiMsg ChatMessage
 	err = s.DB.QueryRow(ctx,
 		`INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'ai', $2) 
-         RETURNING id, laporan_id, sender, message, created_at`,
+        RETURNING id, laporan_id, sender, message, created_at`,
 		laporanID, aiMessageText,
 	).Scan(&newAiMsg.ID, &newAiMsg.LaporanID, &newAiMsg.Sender, &newAiMsg.Message, &newAiMsg.CreatedAt)
 	if err != nil {
@@ -849,7 +877,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, newAiMsg)
 }
-
 func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string) ([]genai.Part, error) {
 	var parts []genai.Part
 	var b strings.Builder
