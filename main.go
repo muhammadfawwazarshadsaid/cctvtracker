@@ -681,37 +681,41 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, users)
 }
-// file: main.go
-
 func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
-	var p LaporanPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if p.JenisLaporan == "" || p.NamaPelapor == "" {
-		http.Error(w, "jenis_laporan dan nama_pelapor wajib diisi", http.StatusBadRequest)
-		return
-	}
+    var p LaporanPayload
+    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+        http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+        return
+    }
+    if p.JenisLaporan == "" || p.NamaPelapor == "" {
+        http.Error(w, "jenis_laporan dan nama_pelapor wajib diisi", http.StatusBadRequest)
+        return
+    }
 
-	ctx := r.Context()
-	var newLaporan Laporan
+    ctx := r.Context()
+    var newLaporan Laporan
     
-    // PERUBAHAN: Menambahkan kolom 'status' dan mengisinya dengan 'draft' secara eksplisit
-	err := s.DB.QueryRow(ctx, `
+    err := s.DB.QueryRow(ctx, `
         INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status)
         VALUES ($1, $2, $3, $4, $5, $6, 'draft')
         RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
     `, p.JenisLaporan, p.NamaPelapor, p.NamaBarang, p.Deskripsi, p.Lokasi, nullify(p.GambarBarangB64)).Scan(
-		&newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
-	)
+        &newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
+    )
 
-	if err != nil {
-		http.Error(w, "gagal menyimpan laporan: "+err.Error(), 500)
-		return
-	}
-	writeJSON(w, http.StatusCreated, newLaporan)
-}// file: main.go
+    if err != nil {
+        // === ADD THIS LOGGING ===
+        log.Printf("FATAL: Gagal membuat laporan draft: %v", err) 
+        // ========================
+        http.Error(w, "gagal menyimpan laporan awal: "+err.Error(), 500)
+        return
+    }
+
+    // Log the success for debugging
+    log.Printf("Berhasil membuat laporan draft dengan ID: %d", newLaporan.ID)
+    
+    writeJSON(w, http.StatusCreated, newLaporan)
+}
 
 func (s *Server) handleGetLaporan(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -940,8 +944,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	err = json.Unmarshal([]byte(jsonString), &toolCall)
 
 	if err == nil && toolCall.ToolCode == "generateLaporan" {
+		
+        // PASTIKAN BARIS INI MEMANGGIL "finalizeLaporanFromAI"
 		finalLaporan, err := s.finalizeLaporanFromAI(ctx, laporanID, toolCall, p.ImageB64)
-		if err != nil {
+		
+        if err != nil {
+			// Ini yang menyebabkan pesan error muncul di Flutter
 			http.Error(w, "gagal memfinalisasi laporan dari AI: "+err.Error(), 500)
 			return
 		}
@@ -950,7 +958,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	} else {
 		aiMessageText = strings.Trim(aiMessageText, "` \n")
 	}
-
 	err = s.DB.QueryRow(ctx,
 		`INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'ai', $2) 
          RETURNING id, laporan_id, sender, message, created_at`,
@@ -1016,7 +1023,6 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
 	}
 	return parts, nil
 }
-
 func (s *Server) finalizeLaporanFromAI(ctx context.Context, laporanID int64, toolCall AiToolCall, imageB64 string) (*Laporan, error) {
 	var deskripsi string
 	rows, err := s.DB.Query(ctx, "SELECT message FROM chat_messages WHERE laporan_id = $1 AND sender = 'user' ORDER BY created_at DESC LIMIT 3", laporanID)
