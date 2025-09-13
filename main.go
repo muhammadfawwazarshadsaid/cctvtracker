@@ -56,7 +56,7 @@ type CCTVIncident struct {
 	GroupKey         string    `json:"group_key"`
 	OwnerName        *string   `json:"owner_name,omitempty"`
 	ItemName         *string   `json:"item_name,omitempty"`
-	Status           string    `json:"status"` // 'unattended', 'taken', 'resolved_owner', 'resolved_secured'
+	Status           string    `json:"status"` // 'attended', 'unattended', 'taken', 'resolved_owner', 'resolved_secured'
 	LastSnapshotB64  *string   `json:"last_snapshot_b64,omitempty"`
 	LaporanTerkaitID *int64    `json:"laporan_terkait_id,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
@@ -99,66 +99,180 @@ type StatusUpdatePayload struct {
 	Status string `json:"status"`
 }
 
+// =================================================================================
+// MODIFIED FUNCTION: handleNotify
+// =================================================================================
+func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
+	var p NotifyPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.GroupKey == "" || p.EventType == "" {
+		http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, "gagal memulai transaksi: "+err.Error(), 500)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var incidentID int64
+	var currentStatus string
+
+	// Cek apakah insiden sudah ada
+	err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1 FOR UPDATE", p.GroupKey).Scan(&incidentID, &currentStatus)
+
+	if err != nil { // Jika insiden belum ada (error 'no rows')
+		// Event pertama harus 'attended' atau 'unattended' untuk membuat insiden baru
+		newStatus := "created" // Status default sementara
+		if p.EventType == "attended" {
+			newStatus = "attended"
+		} else if p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else {
+			http.Error(w, "event pertama harus 'attended' atau 'unattended'", http.StatusBadRequest)
+			return
+		}
+
+		// Buat insiden baru
+		err = tx.QueryRow(ctx, `
+            INSERT INTO cctv_incidents (group_key, owner_name, item_name, status, last_snapshot_b64)
+            VALUES ($1, $2, $3, $4, $5) RETURNING id
+        `, p.GroupKey, nullify(p.OwnerName), nullify(p.ItemName), newStatus, nullify(p.SnapshotB64)).Scan(&incidentID)
+		if err != nil {
+			http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
+			return
+		}
+		log.Printf("Insiden baru #%d dibuat dengan status '%s' untuk group_key '%s'", incidentID, newStatus, p.GroupKey)
+
+	} else { // Jika insiden sudah ada, update
+		newStatus := currentStatus
+		// Logika transisi status otomatis
+		if currentStatus == "attended" && p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else if currentStatus == "unattended" && p.EventType == "item_taken_by_other" {
+			newStatus = "taken"
+		}
+
+		// Bangun query update
+		query := "UPDATE cctv_incidents SET updated_at=now()"
+		args := []interface{}{}
+		argID := 1
+
+		if newStatus != currentStatus {
+			query += ", status=$" + strconv.Itoa(argID)
+			args = append(args, newStatus)
+			argID++
+		}
+		if p.SnapshotB64 != "" {
+			query += ", last_snapshot_b64=$" + strconv.Itoa(argID)
+			args = append(args, p.SnapshotB64)
+			argID++
+		}
+
+		query += " WHERE id=$" + strconv.Itoa(argID)
+		args = append(args, incidentID)
+
+		if len(args) > 1 { // Hanya eksekusi jika ada yang diupdate
+			_, err = tx.Exec(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "gagal update insiden: "+err.Error(), 500)
+				return
+			}
+			log.Printf("Insiden #%d diupdate, status berubah dari '%s' -> '%s'", incidentID, currentStatus, newStatus)
+		}
+	}
+
+	// Selalu catat setiap event yang masuk
+	finalMessage := p.Message
+	if finalMessage == "" {
+		finalMessage = p.EventType // fallback jika message kosong
+	}
+
+	_, err = tx.Exec(ctx, `
+        INSERT INTO cctv_events (incident_id, event_type, message, occurred_at) VALUES ($1, $2, $3, $4)
+    `, incidentID, p.EventType, finalMessage, p.Timestamp)
+	if err != nil {
+		http.Error(w, "gagal catat event: "+err.Error(), 500)
+		return
+	}
+
+	// Commit transaksi
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "gagal commit transaksi: "+err.Error(), 500)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
+}
+
+// ... Sisa kode Go Anda (main, runMigrations, handleLaporan, handleChat, dll.) tetap sama ...
+// ... Salin-tempel semua fungsi lain dari kode Go Anda sebelumnya di sini ...
 func main() {
-	_ = godotenv.Load()
+    _ = godotenv.Load()
 
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL env kosong. Contoh: postgres://user:pass@localhost:5432/db_lostfound?sslmode=disable")
-	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		log.Fatalf("Gagal konek database: %v", err)
-	}
-	defer pool.Close()
+    dsn := os.Getenv("DATABASE_URL")
+    if dsn == "" {
+        log.Fatal("DATABASE_URL env kosong. Contoh: postgres://user:pass@localhost:5432/db_lostfound?sslmode=disable")
+    }
+    ctx := context.Background()
+    pool, err := pgxpool.New(ctx, dsn)
+    if err != nil {
+        log.Fatalf("Gagal konek database: %v", err)
+    }
+    defer pool.Close()
 
-	if err := runMigrations(ctx, pool); err != nil {
-		log.Fatalf("Gagal migrasi: %v", err)
-	}
+    if err := runMigrations(ctx, pool); err != nil {
+        log.Fatalf("Gagal migrasi: %v", err)
+    }
 
-	geminiAPIKey := os.Getenv("GOOGLE_API_KEY")
-	if geminiAPIKey == "" {
-		log.Fatal("GOOGLE_API_KEY env kosong.")
-	}
-	geminiClient, err := genai.NewClient(ctx, option.WithAPIKey(geminiAPIKey))
-	if err != nil {
-		log.Fatalf("Gagal membuat klien Gemini: %v", err)
-	}
-	defer geminiClient.Close()
-	geminiModel := geminiClient.GenerativeModel("gemini-1.5-flash")
+    geminiAPIKey := os.Getenv("GOOGLE_API_KEY")
+    if geminiAPIKey == "" {
+        log.Fatal("GOOGLE_API_KEY env kosong.")
+    }
+    geminiClient, err := genai.NewClient(ctx, option.WithAPIKey(geminiAPIKey))
+    if err != nil {
+        log.Fatalf("Gagal membuat klien Gemini: %v", err)
+    }
+    defer geminiClient.Close()
+    geminiModel := geminiClient.GenerativeModel("gemini-1.5-flash")
 
-	s := &Server{
-		DB:     pool,
-		Gemini: geminiModel,
-	}
+    s := &Server{
+        DB:     pool,
+        Gemini: geminiModel,
+    }
 
-	mux := http.NewServeMux()
+    mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /laporan", s.handleBuatLaporan)
-	mux.HandleFunc("GET /laporan", s.handleGetLaporan)
-	mux.HandleFunc("GET /laporan/{id}", s.handleGetDetailLaporan)
-	mux.HandleFunc("POST /laporan/{id}/chat", s.handleChat)
+    mux.HandleFunc("POST /laporan", s.handleBuatLaporan)
+    mux.HandleFunc("GET /laporan", s.handleGetLaporan)
+    mux.HandleFunc("GET /laporan/{id}", s.handleGetDetailLaporan)
+    mux.HandleFunc("POST /laporan/{id}/chat", s.handleChat)
 
-	mux.HandleFunc("POST /notify", s.handleNotify)
-	mux.HandleFunc("GET /incidents", s.handleGetIncidents)
-	mux.HandleFunc("GET /incidents/{id}", s.handleGetIncidentDetail)
-	mux.HandleFunc("POST /incidents/{id}/create-report", s.handleCreateReportFromIncident)
-	mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
+    mux.HandleFunc("POST /notify", s.handleNotify)
+    mux.HandleFunc("GET /incidents", s.handleGetIncidents)
+    mux.HandleFunc("GET /incidents/{id}", s.handleGetIncidentDetail)
+    mux.HandleFunc("POST /incidents/{id}/create-report", s.handleCreateReportFromIncident)
+    mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "3000"
-	}
-	addr := ":" + port
-	log.Println("Server berjalan di", addr)
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "3000"
+    }
+    addr := ":" + port
+    log.Println("Server berjalan di", addr)
 
-	allowedOrigins := handlers.AllowedOrigins([]string{"*"})
-	allowedMethods := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
-	allowedHeaders := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
-	handler := logRequest(handlers.CORS(allowedOrigins, allowedMethods, allowedHeaders)(mux))
+    allowedOrigins := handlers.AllowedOrigins([]string{"*"})
+    allowedMethods := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
+    allowedHeaders := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
+    handler := logRequest(handlers.CORS(allowedOrigins, allowedMethods, allowedHeaders)(mux))
 
-	log.Fatal(http.ListenAndServe(addr, handler))
+    log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
@@ -440,91 +554,6 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
         }
     }
     return parts, nil
-}
-
-func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
-    var p NotifyPayload
-    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-        http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-        return
-    }
-    if p.GroupKey == "" || p.EventType == "" {
-        http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
-        return
-    }
-
-    ctx := r.Context()
-    tx, err := s.DB.Begin(ctx)
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer tx.Rollback(ctx)
-
-    var incidentID int64
-    var currentStatus string
-
-    err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1", p.GroupKey).Scan(&incidentID, &currentStatus)
-
-    if err != nil {
-        // Hanya event 'unattended' yang boleh membuat insiden baru
-        if p.EventType != "unattended" {
-            http.Error(w, "insiden belum ada, hanya event 'unattended' yang diterima pertama kali", http.StatusBadRequest)
-            return
-        }
-        err = tx.QueryRow(ctx, `
-            INSERT INTO cctv_incidents (group_key, owner_name, item_name, status, last_snapshot_b64)
-            VALUES ($1, $2, $3, 'unattended', $4) RETURNING id
-        `, p.GroupKey, nullify(p.OwnerName), nullify(p.ItemName), nullify(p.SnapshotB64)).Scan(&incidentID)
-        if err != nil {
-            http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
-            return
-        }
-    } else {
-        // Jika insiden sudah ada, update
-        updateQuery := "UPDATE cctv_incidents SET updated_at=now()"
-        args := []interface{}{}
-        argID := 1
-
-        if p.EventType == "item_taken_by_other" && currentStatus == "unattended" {
-            updateQuery += ", status=$" + strconv.Itoa(argID)
-            args = append(args, "taken")
-            argID++
-        }
-        if p.SnapshotB64 != "" {
-            updateQuery += ", last_snapshot_b64=$" + strconv.Itoa(argID)
-            args = append(args, p.SnapshotB64)
-            argID++
-        }
-
-        updateQuery += " WHERE id=$" + strconv.Itoa(argID)
-        args = append(args, incidentID)
-
-        _, err = tx.Exec(ctx, updateQuery, args...)
-        if err != nil {
-            http.Error(w, "gagal update insiden: "+err.Error(), 500)
-            return
-        }
-    }
-
-    finalMessage := p.Message
-    if finalMessage == "" {
-        finalMessage = p.EventType // fallback
-    }
-
-    _, err = tx.Exec(ctx, `
-        INSERT INTO cctv_events (incident_id, event_type, message, occurred_at) VALUES ($1, $2, $3, $4)
-    `, incidentID, p.EventType, finalMessage, p.Timestamp)
-    if err != nil {
-        http.Error(w, "gagal catat event: "+err.Error(), 500)
-        return
-    }
-
-    if err := tx.Commit(ctx); err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
 }
 
 func (s *Server) handleGetIncidents(w http.ResponseWriter, r *http.Request) {
