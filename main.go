@@ -782,7 +782,15 @@ func (s *Server) handleGetDetailLaporan(w http.ResponseWriter, r *http.Request) 
 		"log_aktivitas": chatHistory,
 	})
 }
-// main.go
+type AiAction struct {
+    Action       string `json:"action"`
+    JenisLaporan string `json:"jenis_laporan"`
+    NamaPelapor  string `json:"nama_pelapor"`
+    NamaBarang   string `json:"nama_barang"`
+    Lokasi       string `json:"lokasi"`
+    Deskripsi    string `json:"deskripsi"`
+}
+
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	laporanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -793,31 +801,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	
-    // --- LOGIKA BARU DIMULAI DI SINI ---
-    // Cek apakah laporan dengan ID ini sudah ada.
     var exists bool
-    err := s.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM laporan WHERE id=$1)", laporanID).Scan(&exists)
-    if err != nil {
-        http.Error(w, "gagal cek laporan: "+err.Error(), 500)
-        return
-    }
-
-    // Jika laporan BELUM ADA, buat laporan baru sebagai "wadah" chat.
+    s.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM laporan WHERE id=$1)", laporanID).Scan(&exists)
     if !exists {
-        // Untuk amannya, kita buat laporan baru dengan ID yang diminta jika memungkinkan
-        // Ini adalah pendekatan sederhana, di produksi mungkin perlu logika berbeda.
-        _, err = s.DB.Exec(ctx, `
-            INSERT INTO laporan (id, jenis_laporan, nama_pelapor, status) 
-            VALUES ($1, 'obrolan', 'Pengguna', 'terbuka')
-            ON CONFLICT (id) DO NOTHING
-        `, laporanID)
-        if err != nil {
-            http.Error(w, "gagal membuat wadah laporan baru: "+err.Error(), 500)
-            return
-        }
+        s.DB.Exec(ctx, `INSERT INTO laporan (id, jenis_laporan, nama_pelapor, status) VALUES ($1, 'obrolan', 'Pengguna', 'terbuka') ON CONFLICT (id) DO NOTHING`, laporanID)
 		log.Printf("Membuat wadah laporan baru untuk chat dengan ID: %d", laporanID)
     }
-    // --- LOGIKA BARU SELESAI ---
 
 	var p ChatPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -833,7 +822,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if p.ImageB64 != "" {
 		userMessage = strings.TrimSpace(userMessage + " [pengguna melampirkan sebuah gambar]")
 	}
-	_, err = s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
+	_, err := s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
 	if err != nil {
 		http.Error(w, "gagal simpan pesan user: "+err.Error(), 500)
 		return
@@ -847,7 +836,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.Gemini.GenerateContent(ctx, promptParts...)
 	if err != nil {
-		log.Printf("Error Gemini API: %v", err)
 		http.Error(w, "gagal komunikasi dengan AI: "+err.Error(), 502)
 		return
 	}
@@ -856,11 +844,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if aiMessageText == "" {
 		aiMessageText = "Maaf, saya tidak bisa memberikan balasan saat ini."
 	}
+    
+    // --- LOGIKA BARU UNTUK MEMBUAT LAPORAN ---
+    var newAiMsg ChatMessage
+	var action AiAction
+    
+    // Coba parse teks dari AI sebagai JSON
+    err = json.Unmarshal([]byte(aiMessageText), &action)
+    
+    // Jika berhasil di-parse dan actionnya adalah "create_report"
+    if err == nil && action.Action == "create_report" {
+        newLaporan, err := s.createLaporanFromAI(ctx, action, p.ImageB64)
+        if err != nil {
+            http.Error(w, "gagal membuat laporan dari AI: "+err.Error(), 500)
+            return
+        }
 
-	var newAiMsg ChatMessage
+        // Teks balasan ke user diubah menjadi konfirmasi
+        aiMessageText = fmt.Sprintf("Baik, laporan %s untuk '%s' telah dibuat. Petugas akan segera menindaklanjuti.", action.JenisLaporan, action.NamaBarang)
+        newAiMsg.AttachmentLaporan = newLaporan // Lampirkan laporan yang baru dibuat
+    }
+    // --- AKHIR LOGIKA BARU ---
+
 	err = s.DB.QueryRow(ctx,
 		`INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'ai', $2) 
-        RETURNING id, laporan_id, sender, message, created_at`,
+         RETURNING id, laporan_id, sender, message, created_at`,
 		laporanID, aiMessageText,
 	).Scan(&newAiMsg.ID, &newAiMsg.LaporanID, &newAiMsg.Sender, &newAiMsg.Message, &newAiMsg.CreatedAt)
 	if err != nil {
@@ -868,85 +876,94 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	matchID := findReportIDInText(aiMessageText)
-	if matchID > 0 {
-		attachedLaporan, err := s.fetchLaporanByID(ctx, matchID)
-		if err == nil {
-			newAiMsg.AttachmentLaporan = attachedLaporan
-		}
-	}
-
 	writeJSON(w, http.StatusCreated, newAiMsg)
 }
+
+// Tambahkan fungsi helper baru ini di bawah `handleChat`
+func (s *Server) createLaporanFromAI(ctx context.Context, action AiAction, imageB64 string) (*Laporan, error) {
+    var newLaporan Laporan
+    err := s.DB.QueryRow(ctx, `
+        INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
+    `, action.JenisLaporan, action.NamaPelapor, action.NamaBarang, action.Deskripsi, action.Lokasi, nullify(imageB64)).Scan(
+        &newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
+    )
+    if err != nil {
+        return nil, err
+    }
+    return &newLaporan, nil
+}
+// main.go
 
 func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string, cctvIncidentID *int64) ([]genai.Part, error) {
 	var parts []genai.Part
 	var b strings.Builder
 
 	b.WriteString("Anda adalah Akai, asisten AI spesialis Lost & Found yang cerdas dan proaktif.\n")
+	b.WriteString("Tugas utama Anda adalah membantu pengguna membuat laporan kehilangan atau penemuan barang.\n")
 
 	// --- LOGIKA BARU: Cek jika ada konteks dari CCTV ---
+	var incidentDataString string
+	var defaultPelapor string = "Pengguna"
 	if cctvIncidentID != nil {
 		var incident struct {
 			ItemName          *string
 			LastKnownLocation *string
-			CreatedAt         time.Time
+			OwnerName         *string
 		}
+		// Ambil data insiden dari database berdasarkan ID yang dikirim frontend
 		err := s.DB.QueryRow(ctx,
-			"SELECT item_name, last_known_location, created_at FROM cctv_incidents WHERE id=$1",
-			*cctvIncidentID).Scan(&incident.ItemName, &incident.LastKnownLocation, &incident.CreatedAt)
+			"SELECT i.item_name, i.last_known_location, u.name as owner_name FROM cctv_incidents i LEFT JOIN users u ON i.owner_id = u.id WHERE i.id=$1",
+			*cctvIncidentID).Scan(&incident.ItemName, &incident.LastKnownLocation, &incident.OwnerName)
 
 		if err == nil {
+			defaultPelapor = strFallback(incident.OwnerName, "Pengguna")
 			b.WriteString("--- KONTEKS DARI CCTV ---\n")
 			b.WriteString("Pengguna melaporkan kehilangan barang yang sudah terdeteksi oleh sistem CCTV.\n")
+			b.WriteString(fmt.Sprintf("- Pelapor: %s\n", defaultPelapor))
 			b.WriteString(fmt.Sprintf("- Barang yang Hilang: %s\n", strFallback(incident.ItemName, "Belum teridentifikasi")))
 			b.WriteString(fmt.Sprintf("- Lokasi Terakhir: %s\n", strFallback(incident.LastKnownLocation, "Tidak diketahui")))
-			b.WriteString(fmt.Sprintf("- Waktu Terdeteksi: %s\n", incident.CreatedAt.Format(time.RFC1123)))
-			b.WriteString("Tugas Anda: JANGAN bertanya lagi tentang nama barang, lokasi, atau waktu. Gunakan informasi ini untuk LANGSUNG membuat laporan kehilangan. Beri konfirmasi ke pengguna bahwa laporan berdasarkan data CCTV telah dibuat dan tanyakan detail tambahan seperti 'warna' atau 'merek' jika diperlukan.\n\n")
+			
+			// Simpan data ini untuk nanti dimasukkan ke laporan dan prompt
+			incidentDataString = fmt.Sprintf("Barang: %s, Lokasi: %s, Pelapor: %s", strFallback(incident.ItemName, ""), strFallback(incident.LastKnownLocation, ""), defaultPelapor)
 		}
 	}
 
-	b.WriteString("--- ATURAN UMUM ---\n")
-	b.WriteString("1. Jika pengguna melaporkan PENEMUAN, tanyakan detail barang, lokasi, dan waktu ditemukan.\n")
-	b.WriteString("2. Jika pengguna melaporkan KEHILANGAN tanpa konteks CCTV, tanyakan detailnya.\n")
-	b.WriteString("3. Jika setelah mendapat detail, Anda menemukan KECOCOKAN dengan laporan lain di 'Konteks Tambahan', beritahu pengguna dengan format: 'Saya menemukan kemungkinan kecocokan dengan laporan #${ID_LAPORAN_MATCH}.'\n")
-	b.WriteString("4. Selalu balas dengan ramah.\n\n")
+	b.WriteString("--- ATURAN WAJIB ---\n")
+	b.WriteString("1. Jika informasi dari pengguna SUDAH CUKUP untuk membuat laporan (misal: ada nama barang dan lokasi), JANGAN bertanya lagi. Langsung buat laporan.\n")
+	b.WriteString("2. Saat Anda memutuskan untuk MEMBUAT LAPORAN BARU, akhiri SELURUH respon Anda HANYA dengan format JSON TUNGGAL berikut, TANPA teks atau markdown tambahan lain:\n")
+	b.WriteString("   `{\"action\": \"create_report\", \"jenis_laporan\": \"kehilangan/penemuan\", \"nama_pelapor\": \"Nama Pelapor\", \"nama_barang\": \"Nama Barang\", \"lokasi\": \"Lokasi Barang\", \"deskripsi\": \"Deskripsi tambahan jika ada\"}`\n")
+	b.WriteString(fmt.Sprintf("3. Untuk field 'nama_pelapor', selalu gunakan '%s' kecuali pengguna menyebutkan nama lain.\n", defaultPelapor))
+	b.WriteString("4. Jika informasi KURANG, ajukan pertanyaan spesifik untuk melengkapinya (misal: 'Bisa deskripsikan barangnya seperti apa?').\n")
+	b.WriteString("5. Jika pengguna hanya bertanya atau menyapa, jawablah secara natural dan ramah.\n\n")
 
-	var l Laporan
-	err := s.DB.QueryRow(ctx, `SELECT jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi FROM laporan WHERE id=$1`, laporanID).Scan(
-		&l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi)
-	if err != nil {
-		return nil, err
-	}
-
-	b.WriteString(fmt.Sprintf("--- LAPORAN CHAT SAAT INI (ID: %d) ---\n", laporanID))
-	b.WriteString(fmt.Sprintf("- Jenis: %s\n- Pelapor: %s\n\n", l.JenisLaporan, l.NamaPelapor))
-
-	b.WriteString("--- KONTEKS TAMBAHAN: LAPORAN LAIN YANG RELEVAN ---\n")
-	matchRows, _ := s.DB.Query(ctx,
-		`SELECT id, jenis_laporan, nama_barang, deskripsi, lokasi FROM laporan WHERE status='terbuka' AND id != $1 ORDER BY waktu_laporan DESC LIMIT 5`,
-		laporanID)
 	
-	foundMatches := false
-	defer matchRows.Close()
-	for matchRows.Next() {
-		foundMatches = true
-		var m struct {
-			ID                            int64
-			JenisLaporan                  string
-			NamaBarang, Deskripsi, Lokasi *string
-		}
-		if err := matchRows.Scan(&m.ID, &m.JenisLaporan, &m.NamaBarang, &m.Deskripsi, &m.Lokasi); err == nil {
-			b.WriteString(fmt.Sprintf("- Laporan #%d (%s): Barang: %s, Deskripsi: %s.\n", m.ID, m.JenisLaporan, strFallback(m.NamaBarang, "?"), strFallback(m.Deskripsi, "?")))
-		}
+	b.WriteString("--- RIWAYAT CHAT SEBELUMNYA ---\n")
+	chatRows, _ := s.DB.Query(ctx, "SELECT sender, message FROM chat_messages WHERE laporan_id=$1 ORDER BY created_at DESC LIMIT 4", laporanID)
+	defer chatRows.Close()
+	var history string
+	for chatRows.Next() {
+		var sender, message string
+		chatRows.Scan(&sender, &message)
+		// Format agar pesan terbaru ada di paling bawah
+		history = fmt.Sprintf("%s: %s\n%s", sender, message, history)
 	}
-	if !foundMatches {
-		b.WriteString("Tidak ada laporan relevan lainnya saat ini.\n")
-	}
-	b.WriteString("\n")
+    if history == "" {
+        b.WriteString("Belum ada riwayat percakapan.\n\n")
+    } else {
+	    b.WriteString(history + "\n")
+    }
+
 
 	b.WriteString("--- PESAN BARU DARI PENGGUNA ---\n")
-	b.WriteString(newUserMessage)
+	// Jika ada konteks CCTV, tambahkan itu ke pesan pengguna agar AI lebih paham
+	if incidentDataString != "" {
+		b.WriteString(fmt.Sprintf("%s (Konteks dari CCTV: %s)",newUserMessage, incidentDataString))
+	} else {
+		b.WriteString(newUserMessage)
+	}
+
 
 	parts = append(parts, genai.Text(b.String()))
 	if newUserImageB64 != "" {
@@ -957,8 +974,6 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
 	}
 	return parts, nil
 }
-// ----- Helper Functions -----
-
 func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, error) {
 	var l Laporan
 	err := s.DB.QueryRow(ctx, `
