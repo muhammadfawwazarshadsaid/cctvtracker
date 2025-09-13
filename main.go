@@ -369,6 +369,13 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 			args = append(args, p.Location)
 			argID++
 		}
+		// --- INI BAGIAN YANG DIPERBAIKI ---
+		if p.ItemName != "" {
+			query += ", item_name=$" + strconv.Itoa(argID)
+			args = append(args, p.ItemName)
+			argID++
+		}
+		// --- AKHIR PERBAIKAN ---
 
 		query += " WHERE id=$" + strconv.Itoa(argID)
 		args = append(args, incidentID)
@@ -400,7 +407,6 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
 }
-
 func (s *Server) handleGetIncidents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	rows, err := s.DB.Query(ctx, `
