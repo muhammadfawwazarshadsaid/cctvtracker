@@ -681,8 +681,7 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, users)
 }
-
-// ----- Handler Laporan & Chat -----
+// file: main.go
 
 func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
 	var p LaporanPayload
@@ -690,16 +689,18 @@ func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if p.JenisLaporan == "" || p.NamaPelapor == "" || p.NamaBarang == "" {
-		http.Error(w, "jenis_laporan, nama_pelapor, dan nama_barang wajib diisi", http.StatusBadRequest)
+	if p.JenisLaporan == "" || p.NamaPelapor == "" {
+		http.Error(w, "jenis_laporan dan nama_pelapor wajib diisi", http.StatusBadRequest)
 		return
 	}
 
 	ctx := r.Context()
 	var newLaporan Laporan
+    
+    // PERUBAHAN: Menambahkan kolom 'status' dan mengisinya dengan 'draft' secara eksplisit
 	err := s.DB.QueryRow(ctx, `
-        INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status)
+        VALUES ($1, $2, $3, $4, $5, $6, 'draft')
         RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
     `, p.JenisLaporan, p.NamaPelapor, p.NamaBarang, p.Deskripsi, p.Lokasi, nullify(p.GambarBarangB64)).Scan(
 		&newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
@@ -710,13 +711,17 @@ func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, newLaporan)
-}
+}// file: main.go
 
 func (s *Server) handleGetLaporan(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+    
+    // PERUBAHAN: Menambahkan "WHERE status != 'draft'" untuk menyaring hasil
 	rows, err := s.DB.Query(ctx, `
         SELECT id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
-        FROM laporan ORDER BY waktu_laporan DESC LIMIT 50
+        FROM laporan
+        WHERE status != 'draft'
+        ORDER BY waktu_laporan DESC LIMIT 50
     `)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
