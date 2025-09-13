@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"golang.org/x/crypto/bcrypt" // Tetap digunakan untuk password
 	"google.golang.org/api/option"
 )
 
@@ -31,9 +32,11 @@ type Server struct {
 
 // User struct
 type User struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           int64     `json:"id"`
+	Name         string    `json:"name"`
+	Email        *string   `json:"email,omitempty"`
+	PasswordHash string    `json:"-"` // Disembunyikan dari output JSON
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type Laporan struct {
@@ -101,7 +104,7 @@ type NotifyPayload struct {
 	OwnerName   string    `json:"owner_name,omitempty"`
 	ItemName    string    `json:"item_name,omitempty"`
 	Message     string    `json:"message,omitempty"`
-	Location    string    `json:"location,omitempty"` // TAMBAHKAN INI
+	Location    string    `json:"location,omitempty"`
 	SnapshotB64 string    `json:"snapshot_b64,omitempty"`
 	Timestamp   time.Time `json:"timestamp"`
 }
@@ -114,13 +117,19 @@ type UserPayload struct {
 	Name string `json:"name"`
 }
 
+type LoginPayload struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
 func main() {
 	_ = godotenv.Load()
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL env kosong. Contoh: postgres://user:pass@localhost:5432/db_lostfound?sslmode=disable")
+		log.Fatal("DATABASE_URL env kosong.")
 	}
+
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -164,6 +173,7 @@ func main() {
 	mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
 
 	// Endpoints User
+	mux.HandleFunc("POST /login", s.handleLogin)
 	mux.HandleFunc("POST /users", s.handleCreateUser)
 	mux.HandleFunc("GET /users", s.handleGetUsers)
 
@@ -209,11 +219,13 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 	}
 
 	usersSQL := `
-	CREATE TABLE IF NOT EXISTS users (
-		id BIGSERIAL PRIMARY KEY,
-		name TEXT NOT NULL UNIQUE,
-		created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-	);`
+    CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        email TEXT UNIQUE,
+        password_hash TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    );`
 	if _, err := db.Exec(ctx, usersSQL); err != nil {
 		return fmt.Errorf("migrasi tabel users gagal: %w", err)
 	}
@@ -224,7 +236,7 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
         group_key TEXT UNIQUE NOT NULL,
         owner_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
         item_name TEXT,
-    	last_known_location TEXT, 
+        last_known_location TEXT, 
         status TEXT NOT NULL,
         last_snapshot_b64 TEXT,
         laporan_terkait_id BIGINT REFERENCES laporan(id) ON DELETE SET NULL,
@@ -246,141 +258,157 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 	}
 	return nil
 }
+
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
-    var p NotifyPayload
-    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-        http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-        return
-    }
-    if p.GroupKey == "" || p.EventType == "" {
-        http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
-        return
-    }
+	var p NotifyPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.GroupKey == "" || p.EventType == "" {
+		http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
+		return
+	}
 
-    ctx := r.Context()
-    tx, err := s.DB.Begin(ctx)
-    if err != nil {
-        http.Error(w, "gagal memulai transaksi: "+err.Error(), 500)
-        return
-    }
-    defer tx.Rollback(ctx)
+	ctx := r.Context()
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, "gagal memulai transaksi: "+err.Error(), 500)
+		return
+	}
+	defer tx.Rollback(ctx)
 
-    var ownerID *int64
-    if p.OwnerName != "" {
-        var id int64
-        err := tx.QueryRow(ctx, "SELECT id FROM users WHERE name = $1", p.OwnerName).Scan(&id)
-        if err != nil {
-            if err == pgx.ErrNoRows {
-                err = tx.QueryRow(ctx, "INSERT INTO users (name) VALUES ($1) RETURNING id", p.OwnerName).Scan(&id)
-                if err != nil {
-                    http.Error(w, "gagal membuat user baru: "+err.Error(), 500)
-                    return
-                }
-                log.Printf("User baru '%s' dibuat dengan ID %d", p.OwnerName, id)
-            } else {
-                http.Error(w, "gagal mencari user: "+err.Error(), 500)
-                return
-            }
-        }
-        ownerID = &id
-    }
+	var ownerID *int64
+	if p.OwnerName != "" {
+		var id int64
+		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE name = $1", p.OwnerName).Scan(&id)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				defaultPassword := "12345678"
+				hashedPassword, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
+				if err != nil {
+					http.Error(w, "gagal hash password: "+err.Error(), 500)
+					return
+				}
+				safeName := strings.ReplaceAll(strings.ToLower(p.OwnerName), " ", "")
+				email := fmt.Sprintf("%s@track.ai", safeName)
+				err = tx.QueryRow(ctx, `
+                    INSERT INTO users (name, email, password_hash)
+                    VALUES ($1, $2, $3)
+                    RETURNING id
+                `, p.OwnerName, email, string(hashedPassword)).Scan(&id)
+				if err != nil {
+					if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+						http.Error(w, "user dengan email atau nama tersebut sudah ada: "+err.Error(), http.StatusConflict)
+						return
+					}
+					http.Error(w, "gagal membuat user baru secara otomatis: "+err.Error(), 500)
+					return
+				}
+				log.Printf("Akun login baru untuk '%s' dibuat dengan email '%s' dan ID %d", p.OwnerName, email, id)
+			} else {
+				http.Error(w, "gagal mencari user: "+err.Error(), 500)
+				return
+			}
+		}
+		ownerID = &id
+	}
 
-    var incidentID int64
-    var currentStatus string
-    err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1 FOR UPDATE", p.GroupKey).Scan(&incidentID, &currentStatus)
+	var incidentID int64
+	var currentStatus string
+	err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1 FOR UPDATE", p.GroupKey).Scan(&incidentID, &currentStatus)
 
-    if err != nil { // Insiden belum ada
-        newStatus := "created"
-        if p.EventType == "attended" {
-            newStatus = "attended"
-        } else if p.EventType == "unattended" {
-            newStatus = "unattended"
-        } else {
-            http.Error(w, "event pertama harus 'attended' atau 'unattended'", http.StatusBadRequest)
-            return
-        }
-        // MODIFIKASI: Tambahkan last_known_location saat INSERT
-        err = tx.QueryRow(ctx, `
+	if err != nil { // Insiden belum ada
+		newStatus := "created"
+		if p.EventType == "attended" {
+			newStatus = "attended"
+		} else if p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else {
+			http.Error(w, "event pertama harus 'attended' atau 'unattended'", http.StatusBadRequest)
+			return
+		}
+		err = tx.QueryRow(ctx, `
             INSERT INTO cctv_incidents (group_key, owner_id, item_name, last_known_location, status, last_snapshot_b64)
             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
         `, p.GroupKey, ownerID, nullify(p.ItemName), nullify(p.Location), newStatus, nullify(p.SnapshotB64)).Scan(&incidentID)
-        if err != nil {
-            http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
-            return
-        }
+		if err != nil {
+			http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
+			return
+		}
 
-    } else { // Insiden sudah ada
-        newStatus := currentStatus
-        if currentStatus == "attended" && p.EventType == "unattended" {
-            newStatus = "unattended"
-        } else if currentStatus == "unattended" && p.EventType == "item_taken_by_other" {
-            newStatus = "taken"
-        }
+	} else { // Insiden sudah ada
+		newStatus := currentStatus
+		if currentStatus == "attended" && p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else if currentStatus == "unattended" && p.EventType == "item_taken_by_other" {
+			newStatus = "taken"
+		}
 
-        query := "UPDATE cctv_incidents SET updated_at=now()"
-        args := []interface{}{}
-        argID := 1
+		query := "UPDATE cctv_incidents SET updated_at=now()"
+		args := []interface{}{}
+		argID := 1
 
-        if newStatus != currentStatus {
-            query += ", status=$" + strconv.Itoa(argID)
-            args = append(args, newStatus)
-            argID++
-        }
-        if p.SnapshotB64 != "" {
-            query += ", last_snapshot_b64=$" + strconv.Itoa(argID)
-            args = append(args, p.SnapshotB64)
-            argID++
-        }
-        if ownerID != nil {
-            query += ", owner_id=$" + strconv.Itoa(argID)
-            args = append(args, *ownerID)
-            argID++
-        }
-        // MODIFIKASI: Tambahkan update untuk last_known_location jika ada
-        if p.Location != "" {
-            query += ", last_known_location=$" + strconv.Itoa(argID)
-            args = append(args, p.Location)
-            argID++
-        }
+		if newStatus != currentStatus {
+			query += ", status=$" + strconv.Itoa(argID)
+			args = append(args, newStatus)
+			argID++
+		}
+		if p.SnapshotB64 != "" {
+			query += ", last_snapshot_b64=$" + strconv.Itoa(argID)
+			args = append(args, p.SnapshotB64)
+			argID++
+		}
+		if ownerID != nil {
+			query += ", owner_id=$" + strconv.Itoa(argID)
+			args = append(args, *ownerID)
+			argID++
+		}
+		if p.Location != "" {
+			query += ", last_known_location=$" + strconv.Itoa(argID)
+			args = append(args, p.Location)
+			argID++
+		}
 
-        query += " WHERE id=$" + strconv.Itoa(argID)
-        args = append(args, incidentID)
+		query += " WHERE id=$" + strconv.Itoa(argID)
+		args = append(args, incidentID)
 
-        if len(args) > 1 {
-            _, err = tx.Exec(ctx, query, args...)
-            if err != nil {
-                http.Error(w, "gagal update insiden: "+err.Error(), 500)
-                return
-            }
-        }
-    }
+		if len(args) > 1 {
+			_, err = tx.Exec(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "gagal update insiden: "+err.Error(), 500)
+				return
+			}
+		}
+	}
 
-    finalMessage := p.Message
-    if finalMessage == "" {
-        finalMessage = p.EventType
-    }
-    _, err = tx.Exec(ctx, `
+	finalMessage := p.Message
+	if finalMessage == "" {
+		finalMessage = p.EventType
+	}
+	_, err = tx.Exec(ctx, `
         INSERT INTO cctv_events (incident_id, event_type, message, occurred_at) VALUES ($1, $2, $3, $4)
     `, incidentID, p.EventType, finalMessage, p.Timestamp)
-    if err != nil {
-        http.Error(w, "gagal catat event: "+err.Error(), 500)
-        return
-    }
+	if err != nil {
+		http.Error(w, "gagal catat event: "+err.Error(), 500)
+		return
+	}
 
-    if err := tx.Commit(ctx); err != nil {
-        http.Error(w, "gagal commit transaksi: "+err.Error(), 500)
-        return
-    }
-    writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "gagal commit transaksi: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
 }
+
 func (s *Server) handleGetIncidents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	rows, err := s.DB.Query(ctx, `
-		SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.laporan_terkait_id 
-		FROM cctv_incidents i
-		LEFT JOIN users u ON i.owner_id = u.id
-		ORDER BY i.updated_at DESC
-	`)
+        SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.laporan_terkait_id 
+        FROM cctv_incidents i
+        LEFT JOIN users u ON i.owner_id = u.id
+        ORDER BY i.updated_at DESC
+    `)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -408,11 +436,11 @@ func (s *Server) handleGetIncidentDetail(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	var incident CCTVIncident
 	err := s.DB.QueryRow(ctx, `
-		SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
-		FROM cctv_incidents i
-		LEFT JOIN users u ON i.owner_id = u.id
-		WHERE i.id=$1
-	`, id).Scan(
+        SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
+        FROM cctv_incidents i
+        LEFT JOIN users u ON i.owner_id = u.id
+        WHERE i.id=$1
+    `, id).Scan(
 		&incident.ID, &incident.GroupKey, &incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.Status, &incident.CreatedAt, &incident.UpdatedAt, &incident.LastSnapshotB64, &incident.LaporanTerkaitID)
 	if err != nil {
 		http.Error(w, "insiden tidak ditemukan: "+err.Error(), 404)
@@ -458,11 +486,11 @@ func (s *Server) handleCreateReportFromIncident(w http.ResponseWriter, r *http.R
 
 	var incident CCTVIncident
 	err = tx.QueryRow(ctx, `
-		SELECT i.owner_id, u.name as owner_name, i.item_name, i.last_snapshot_b64, i.status
-		FROM cctv_incidents i
-		LEFT JOIN users u ON i.owner_id = u.id
-		WHERE i.id=$1
-	`, incidentID).Scan(
+        SELECT i.owner_id, u.name as owner_name, i.item_name, i.last_snapshot_b64, i.status
+        FROM cctv_incidents i
+        LEFT JOIN users u ON i.owner_id = u.id
+        WHERE i.id=$1
+    `, incidentID).Scan(
 		&incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.LastSnapshotB64, &incident.Status)
 	if err != nil {
 		http.Error(w, "insiden tidak ditemukan", 404)
@@ -535,7 +563,7 @@ func (s *Server) handleUpdateIncidentStatus(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Insiden tidak ditemukan", 404)
 		return
 	}
-	updatedIncident, err := s.fetchIncidentByID(ctx, incidentID) // Helper function
+	updatedIncident, err := s.fetchIncidentByID(ctx, incidentID)
 	if err != nil {
 		http.Error(w, "Gagal mengambil data terbaru: "+err.Error(), 500)
 		return
@@ -544,6 +572,43 @@ func (s *Server) handleUpdateIncidentStatus(w http.ResponseWriter, r *http.Reque
 }
 
 // ----- Handler User -----
+
+// DIMODIFIKASI: Handler Login tanpa JWT
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var p LoginPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Payload JSON tidak valid: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.Email == "" || p.Password == "" {
+		http.Error(w, "Email dan password wajib diisi", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	var user User
+	err := s.DB.QueryRow(ctx,
+		`SELECT id, name, email, password_hash, created_at FROM users WHERE email = $1`,
+		p.Email).Scan(&user.ID, &user.Name, &user.Email, &user.PasswordHash, &user.CreatedAt)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, "Kombinasi email dan password salah", http.StatusUnauthorized)
+			return
+		}
+		http.Error(w, "Gagal mengambil data user: "+err.Error(), 500)
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(p.Password))
+	if err != nil {
+		http.Error(w, "Kombinasi email dan password salah", http.StatusUnauthorized)
+		return
+	}
+
+	// Jika login berhasil, langsung kirim data user (tanpa password)
+	writeJSON(w, http.StatusOK, user)
+}
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var p UserPayload
@@ -559,10 +624,10 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var newUser User
 	ctx := r.Context()
 	err := s.DB.QueryRow(ctx, `
-		INSERT INTO users (name) VALUES ($1)
-		ON CONFLICT (name) DO NOTHING
-		RETURNING id, name, created_at
-	`, p.Name).Scan(&newUser.ID, &newUser.Name, &newUser.CreatedAt)
+        INSERT INTO users (name) VALUES ($1)
+        ON CONFLICT (name) DO NOTHING
+        RETURNING id, name, created_at
+    `, p.Name).Scan(&newUser.ID, &newUser.Name, &newUser.CreatedAt)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -577,7 +642,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rows, err := s.DB.Query(ctx, "SELECT id, name, created_at FROM users ORDER BY name ASC")
+	rows, err := s.DB.Query(ctx, "SELECT id, name, email, created_at FROM users ORDER BY name ASC")
 	if err != nil {
 		http.Error(w, "gagal mengambil data user: "+err.Error(), 500)
 		return
@@ -587,7 +652,7 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	users := []User{}
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Name, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt); err != nil {
 			http.Error(w, "gagal scan data user: "+err.Error(), 500)
 			return
 		}
@@ -597,7 +662,7 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 // ----- Handler Laporan & Chat (Tidak Berubah) -----
-
+// ... (semua fungsi setelah ini tidak ada perubahan)
 func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
 	var p LaporanPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -760,7 +825,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string) ([]genai.Part, error) {
-	// ... (Fungsi ini tidak berubah)
 	var parts []genai.Part
 	var b strings.Builder
 
@@ -826,7 +890,6 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
 	return parts, nil
 }
 
-
 // ----- Helper Functions -----
 
 func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, error) {
@@ -844,11 +907,11 @@ func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, erro
 func (s *Server) fetchIncidentByID(ctx context.Context, id int64) (*CCTVIncident, error) {
 	var i CCTVIncident
 	err := s.DB.QueryRow(ctx, `
-		SELECT i.id, i.group_key, i.owner_id, u.name AS owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
-		FROM cctv_incidents i
-		LEFT JOIN users u ON i.owner_id = u.id
-		WHERE i.id=$1
-	`, id).Scan(
+        SELECT i.id, i.group_key, i.owner_id, u.name AS owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
+        FROM cctv_incidents i
+        LEFT JOIN users u ON i.owner_id = u.id
+        WHERE i.id=$1
+    `, id).Scan(
 		&i.ID, &i.GroupKey, &i.OwnerID, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LastSnapshotB64, &i.LaporanTerkaitID)
 	if err != nil {
 		return nil, err
