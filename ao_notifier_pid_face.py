@@ -115,41 +115,36 @@ def image_to_base64(path: str) -> Optional[str]:
         return None
 def notify_backend(
     group_key,
-    owner_pid,  # owner_pid tidak dipakai di payload Go, tapi kita biarkan di signature
+    owner_pid,
     owner_name,
     item_name,
     snap_type,
     frame_path=None,
     crop_path=None,
     message=None,
-    location=None, # location juga tidak dipakai
-    meta=None,      # meta juga tidak dipakai
+    location=None, # Sekarang parameter ini akan kita gunakan
+    meta=None,
 ):
-    # Pilih data gambar mana yang mau dikirim. Go hanya menerima satu.
-    # Kita prioritaskan frame utuh, jika tidak ada baru crop.
     image_data_b64 = image_to_base64(frame_path) or image_to_base64(crop_path)
 
-    # BUAT PAYLOAD SESUAI FORMAT GO
     payload = {
         "group_key": group_key,
-        "event_type": snap_type,  # Ganti nama dari 'type' -> 'event_type' dan pindahkan ke atas
+        "event_type": snap_type,
         "owner_name": owner_name,
         "item_name": item_name,
         "message": message or "",
-        "snapshot_b64": image_data_b64, # Ganti nama -> 'snapshot_b64' dan pilih salah satu gambar
-        "timestamp": datetime.now(timezone.utc).isoformat() # Ganti nama dari 'ts' -> 'timestamp'
+        "location": location or "Lokasi Tidak Dikenal", # BARU: Tambahkan lokasi ke payload
+        "snapshot_b64": image_data_b64,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     try:
-        # Hapus 'snapshot' dari URL, karena endpointnya hanya /notify
-        # URL yang benar sudah diatur di BACKEND_URL
         r = requests.post(BACKEND_URL, json=payload, timeout=10)
         
         print(f"[NOTIFY] Mengirim event '{snap_type}' untuk '{group_key}' -> Status: {r.status_code}")
         if r.status_code >= 300:
             print(f"[BACKEND-ERROR] Gagal kirim ({r.status_code}): {r.text}")
         else:
-            # Jika sukses, backend Go akan merespon dengan JSON
             try:
                 print(f"[BACKEND-SUCCESS] Response: {r.json()}")
             except requests.exceptions.JSONDecodeError:
@@ -157,6 +152,39 @@ def notify_backend(
 
     except Exception as e:
         print(f"[NOTIFY-ERROR] Gagal mengirim request: {e}")
+
+def analyze_location_with_gemini(frame_image_path: str) -> Optional[str]:
+    """
+    Kirim frame utuh ke Gemini untuk menebak lokasi.
+    """
+    try:
+        # Ganti dengan API Key Anda atau muat dari environment variable
+        api_key = os.getenv("GOOGLE_API_KEY", "AIzaSy...Anda") 
+        if not api_key:
+            print("[GEMINI-ERROR] GOOGLE_API_KEY tidak ditemukan.")
+            return None
+        genai.configure(api_key=api_key)
+
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        img = Image.open(frame_image_path)
+
+        # Prompt yang dirancang untuk jawaban singkat
+        prompt = (
+            "Analisis gambar pemandangan ini. Identifikasi lokasi atau jenis ruangan dalam 1-2 kata. "
+            "Contoh: 'Lobi Kantor', 'Ruang Tunggu', 'Kantin', 'Koridor', 'Taman', 'Area Parkir'. "
+            "Jawab HANYA dengan nama lokasinya."
+        )
+
+        response = model.generate_content([prompt, img])
+        
+        # Membersihkan output dari markdown atau karakter tambahan
+        location_guess = response.text.strip().replace("```", "").replace("\n", " ")
+        print(f"[GEMINI-LOCATION] Lokasi terdeteksi: {location_guess}")
+        return location_guess
+
+    except Exception as e:
+        print(f"[GEMINI-LOCATION-ERROR] {e}")
+        return None
 
 # ---------- Utils ----------
 def is_person(name: str) -> bool:
@@ -620,11 +648,14 @@ def main():
                     obj_state[oid] = st
                     continue
 
-                crop_path = os.path.join(pair_dir, f"TMP_{ts_un}_crop.jpg")
-                cv2.imwrite(crop_path, frame[y1:y2, x1:x2].copy())
+                un_frame_path = os.path.join(pair_dir, f"UNATTENDED_{ts_un}_frame.jpg")
+                cv2.imwrite(un_frame_path, un_frame)
+
+                un_crop_path = os.path.join(pair_dir, f"UNATTENDED_{ts_un}_crop.jpg")
+                cv2.imwrite(un_crop_path, frame[y1:y2, x1:x2].copy())
 
                 # --- cek Gemini ---
-                gemini_result = analyze_with_gemini(crop_path)
+                gemini_result = analyze_with_gemini(un_crop_path)
                 if not gemini_result or gemini_result.get("kategori") != "barang pribadi":
                     print(f"[SKIP] Objek {oid} dilewati (Gemini kategorikan: {gemini_result})")
                     st["snapshot_done"] = True
@@ -632,6 +663,8 @@ def main():
                     continue
 
                 print(f"[CONFIRMED] Objek {oid} adalah barang pribadi → simpan snapshot")
+                print(f"[INFO] Menganalisis lokasi dari frame: {un_frame_path}")
+                location_guess = analyze_location_with_gemini(un_frame_path)
 
                 # Pastikan entry index tersedia
                 pair = index_db["pairs"].setdefault(pair_key, {
@@ -713,11 +746,10 @@ def main():
                     owner_name=st["owner_name"],
                     item_name=(gemini_result.get("nama_objek") if gemini_result else None),
                     snap_type="unattended",
-                    frame_path=un_frame_path, # Path masih dikirim ke fungsi
-                    crop_path=un_crop_path,   # Path masih dikirim ke fungsi
-                    message="",
-                    location=None,
-                    meta=None
+                    frame_path=un_frame_path,
+                    crop_path=un_crop_path,
+                    message=f"Barang '{gemini_result.get('nama_objek', 'Tidak Dikenal')}' ditinggalkan.",
+                    location=location_guess # Kirim hasil tebakan lokasi
                 )
 
                 st["snapshot_done"] = True

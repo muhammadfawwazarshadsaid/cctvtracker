@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/generative-ai-go/genai"
 	"github.com/gorilla/handlers"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"google.golang.org/api/option"
@@ -27,6 +28,13 @@ type Server struct {
 }
 
 // ----- Structs -----
+
+// User struct
+type User struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
 type Laporan struct {
 	ID                int64     `json:"id"`
@@ -54,9 +62,10 @@ type ChatMessage struct {
 type CCTVIncident struct {
 	ID               int64     `json:"id"`
 	GroupKey         string    `json:"group_key"`
+	OwnerID          *int64    `json:"owner_id,omitempty"`
 	OwnerName        *string   `json:"owner_name,omitempty"`
 	ItemName         *string   `json:"item_name,omitempty"`
-	Status           string    `json:"status"` // 'attended', 'unattended', 'taken', 'resolved_owner', 'resolved_secured'
+	Status           string    `json:"status"`
 	LastSnapshotB64  *string   `json:"last_snapshot_b64,omitempty"`
 	LaporanTerkaitID *int64    `json:"laporan_terkait_id,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
@@ -71,7 +80,8 @@ type CCTVEvent struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
-// Payloads
+// ----- Payloads -----
+
 type LaporanPayload struct {
 	JenisLaporan    string `json:"jenis_laporan"`
 	NamaPelapor     string `json:"nama_pelapor"`
@@ -91,6 +101,7 @@ type NotifyPayload struct {
 	OwnerName   string    `json:"owner_name,omitempty"`
 	ItemName    string    `json:"item_name,omitempty"`
 	Message     string    `json:"message,omitempty"`
+	Location    string    `json:"location,omitempty"` // TAMBAHKAN INI
 	SnapshotB64 string    `json:"snapshot_b64,omitempty"`
 	Timestamp   time.Time `json:"timestamp"`
 }
@@ -99,180 +110,76 @@ type StatusUpdatePayload struct {
 	Status string `json:"status"`
 }
 
-// =================================================================================
-// MODIFIED FUNCTION: handleNotify
-// =================================================================================
-func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
-	var p NotifyPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if p.GroupKey == "" || p.EventType == "" {
-		http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
-		return
-	}
-
-	ctx := r.Context()
-	tx, err := s.DB.Begin(ctx)
-	if err != nil {
-		http.Error(w, "gagal memulai transaksi: "+err.Error(), 500)
-		return
-	}
-	defer tx.Rollback(ctx)
-
-	var incidentID int64
-	var currentStatus string
-
-	// Cek apakah insiden sudah ada
-	err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1 FOR UPDATE", p.GroupKey).Scan(&incidentID, &currentStatus)
-
-	if err != nil { // Jika insiden belum ada (error 'no rows')
-		// Event pertama harus 'attended' atau 'unattended' untuk membuat insiden baru
-		newStatus := "created" // Status default sementara
-		if p.EventType == "attended" {
-			newStatus = "attended"
-		} else if p.EventType == "unattended" {
-			newStatus = "unattended"
-		} else {
-			http.Error(w, "event pertama harus 'attended' atau 'unattended'", http.StatusBadRequest)
-			return
-		}
-
-		// Buat insiden baru
-		err = tx.QueryRow(ctx, `
-            INSERT INTO cctv_incidents (group_key, owner_name, item_name, status, last_snapshot_b64)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id
-        `, p.GroupKey, nullify(p.OwnerName), nullify(p.ItemName), newStatus, nullify(p.SnapshotB64)).Scan(&incidentID)
-		if err != nil {
-			http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
-			return
-		}
-		log.Printf("Insiden baru #%d dibuat dengan status '%s' untuk group_key '%s'", incidentID, newStatus, p.GroupKey)
-
-	} else { // Jika insiden sudah ada, update
-		newStatus := currentStatus
-		// Logika transisi status otomatis
-		if currentStatus == "attended" && p.EventType == "unattended" {
-			newStatus = "unattended"
-		} else if currentStatus == "unattended" && p.EventType == "item_taken_by_other" {
-			newStatus = "taken"
-		}
-
-		// Bangun query update
-		query := "UPDATE cctv_incidents SET updated_at=now()"
-		args := []interface{}{}
-		argID := 1
-
-		if newStatus != currentStatus {
-			query += ", status=$" + strconv.Itoa(argID)
-			args = append(args, newStatus)
-			argID++
-		}
-		if p.SnapshotB64 != "" {
-			query += ", last_snapshot_b64=$" + strconv.Itoa(argID)
-			args = append(args, p.SnapshotB64)
-			argID++
-		}
-
-		query += " WHERE id=$" + strconv.Itoa(argID)
-		args = append(args, incidentID)
-
-		if len(args) > 1 { // Hanya eksekusi jika ada yang diupdate
-			_, err = tx.Exec(ctx, query, args...)
-			if err != nil {
-				http.Error(w, "gagal update insiden: "+err.Error(), 500)
-				return
-			}
-			log.Printf("Insiden #%d diupdate, status berubah dari '%s' -> '%s'", incidentID, currentStatus, newStatus)
-		}
-	}
-
-	// Selalu catat setiap event yang masuk
-	finalMessage := p.Message
-	if finalMessage == "" {
-		finalMessage = p.EventType // fallback jika message kosong
-	}
-
-	_, err = tx.Exec(ctx, `
-        INSERT INTO cctv_events (incident_id, event_type, message, occurred_at) VALUES ($1, $2, $3, $4)
-    `, incidentID, p.EventType, finalMessage, p.Timestamp)
-	if err != nil {
-		http.Error(w, "gagal catat event: "+err.Error(), 500)
-		return
-	}
-
-	// Commit transaksi
-	if err := tx.Commit(ctx); err != nil {
-		http.Error(w, "gagal commit transaksi: "+err.Error(), 500)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
+type UserPayload struct {
+	Name string `json:"name"`
 }
 
-// ... Sisa kode Go Anda (main, runMigrations, handleLaporan, handleChat, dll.) tetap sama ...
-// ... Salin-tempel semua fungsi lain dari kode Go Anda sebelumnya di sini ...
 func main() {
-    _ = godotenv.Load()
+	_ = godotenv.Load()
 
-    dsn := os.Getenv("DATABASE_URL")
-    if dsn == "" {
-        log.Fatal("DATABASE_URL env kosong. Contoh: postgres://user:pass@localhost:5432/db_lostfound?sslmode=disable")
-    }
-    ctx := context.Background()
-    pool, err := pgxpool.New(ctx, dsn)
-    if err != nil {
-        log.Fatalf("Gagal konek database: %v", err)
-    }
-    defer pool.Close()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL env kosong. Contoh: postgres://user:pass@localhost:5432/db_lostfound?sslmode=disable")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		log.Fatalf("Gagal konek database: %v", err)
+	}
+	defer pool.Close()
 
-    if err := runMigrations(ctx, pool); err != nil {
-        log.Fatalf("Gagal migrasi: %v", err)
-    }
+	if err := runMigrations(ctx, pool); err != nil {
+		log.Fatalf("Gagal migrasi: %v", err)
+	}
 
-    geminiAPIKey := os.Getenv("GOOGLE_API_KEY")
-    if geminiAPIKey == "" {
-        log.Fatal("GOOGLE_API_KEY env kosong.")
-    }
-    geminiClient, err := genai.NewClient(ctx, option.WithAPIKey(geminiAPIKey))
-    if err != nil {
-        log.Fatalf("Gagal membuat klien Gemini: %v", err)
-    }
-    defer geminiClient.Close()
-    geminiModel := geminiClient.GenerativeModel("gemini-1.5-flash")
+	geminiAPIKey := os.Getenv("GOOGLE_API_KEY")
+	if geminiAPIKey == "" {
+		log.Fatal("GOOGLE_API_KEY env kosong.")
+	}
+	geminiClient, err := genai.NewClient(ctx, option.WithAPIKey(geminiAPIKey))
+	if err != nil {
+		log.Fatalf("Gagal membuat klien Gemini: %v", err)
+	}
+	defer geminiClient.Close()
+	geminiModel := geminiClient.GenerativeModel("gemini-1.5-flash")
 
-    s := &Server{
-        DB:     pool,
-        Gemini: geminiModel,
-    }
+	s := &Server{
+		DB:     pool,
+		Gemini: geminiModel,
+	}
 
-    mux := http.NewServeMux()
+	mux := http.NewServeMux()
 
-    mux.HandleFunc("POST /laporan", s.handleBuatLaporan)
-    mux.HandleFunc("GET /laporan", s.handleGetLaporan)
-    mux.HandleFunc("GET /laporan/{id}", s.handleGetDetailLaporan)
-    mux.HandleFunc("POST /laporan/{id}/chat", s.handleChat)
+	// Endpoints Laporan & Chat
+	mux.HandleFunc("POST /laporan", s.handleBuatLaporan)
+	mux.HandleFunc("GET /laporan", s.handleGetLaporan)
+	mux.HandleFunc("GET /laporan/{id}", s.handleGetDetailLaporan)
+	mux.HandleFunc("POST /laporan/{id}/chat", s.handleChat)
 
-    mux.HandleFunc("POST /notify", s.handleNotify)
-    mux.HandleFunc("GET /incidents", s.handleGetIncidents)
-    mux.HandleFunc("GET /incidents/{id}", s.handleGetIncidentDetail)
-    mux.HandleFunc("POST /incidents/{id}/create-report", s.handleCreateReportFromIncident)
-    mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
+	// Endpoints Insiden CCTV
+	mux.HandleFunc("POST /notify", s.handleNotify)
+	mux.HandleFunc("GET /incidents", s.handleGetIncidents)
+	mux.HandleFunc("GET /incidents/{id}", s.handleGetIncidentDetail)
+	mux.HandleFunc("POST /incidents/{id}/create-report", s.handleCreateReportFromIncident)
+	mux.HandleFunc("PUT /incidents/{id}/status", s.handleUpdateIncidentStatus)
 
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = "3000"
-    }
-    addr := ":" + port
-    log.Println("Server berjalan di", addr)
+	// Endpoints User
+	mux.HandleFunc("POST /users", s.handleCreateUser)
+	mux.HandleFunc("GET /users", s.handleGetUsers)
 
-    allowedOrigins := handlers.AllowedOrigins([]string{"*"})
-    allowedMethods := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
-    allowedHeaders := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
-    handler := logRequest(handlers.CORS(allowedOrigins, allowedMethods, allowedHeaders)(mux))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	addr := ":" + port
+	log.Println("Server berjalan di", addr)
 
-    log.Fatal(http.ListenAndServe(addr, handler))
+	allowedOrigins := handlers.AllowedOrigins([]string{"*"})
+	allowedMethods := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
+	allowedHeaders := handlers.AllowedHeaders([]string{"Content-Type", "Authorization"})
+	handler := logRequest(handlers.CORS(allowedOrigins, allowedMethods, allowedHeaders)(mux))
+
+	log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
@@ -297,17 +204,27 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
         message TEXT NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
     );`
-	_, err := db.Exec(ctx, laporanSQL)
-	if err != nil {
-		return err
+	if _, err := db.Exec(ctx, laporanSQL); err != nil {
+		return fmt.Errorf("migrasi tabel laporan gagal: %w", err)
+	}
+
+	usersSQL := `
+	CREATE TABLE IF NOT EXISTS users (
+		id BIGSERIAL PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+	);`
+	if _, err := db.Exec(ctx, usersSQL); err != nil {
+		return fmt.Errorf("migrasi tabel users gagal: %w", err)
 	}
 
 	cctvSQL := `
     CREATE TABLE IF NOT EXISTS cctv_incidents (
         id BIGSERIAL PRIMARY KEY,
         group_key TEXT UNIQUE NOT NULL,
-        owner_name TEXT,
+        owner_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
         item_name TEXT,
+    	last_known_location TEXT, 
         status TEXT NOT NULL,
         last_snapshot_b64 TEXT,
         laporan_terkait_id BIGINT REFERENCES laporan(id) ON DELETE SET NULL,
@@ -323,405 +240,592 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
     );
     CREATE INDEX IF NOT EXISTS idx_cctv_incidents_status ON cctv_incidents(status);
     `
-	_, err = db.Exec(ctx, cctvSQL)
-	return err
+	_, err := db.Exec(ctx, cctvSQL)
+	if err != nil {
+		return fmt.Errorf("migrasi tabel cctv gagal: %w", err)
+	}
+	return nil
 }
 
-func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
-    var p LaporanPayload
-    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-        http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-        return
-    }
-    if p.JenisLaporan == "" || p.NamaPelapor == "" || p.NamaBarang == "" {
-        http.Error(w, "jenis_laporan, nama_pelapor, dan nama_barang wajib diisi", http.StatusBadRequest)
-        return
-    }
+// ----- Handler CCTV -----
 
-    ctx := r.Context()
-    var newLaporan Laporan
-    err := s.DB.QueryRow(ctx, `
-        INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64)
-        VALUES ($1, $2, $3, $4, $5, $6) 
-        RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
-    `, p.JenisLaporan, p.NamaPelapor, p.NamaBarang, p.Deskripsi, p.Lokasi, nullify(p.GambarBarangB64)).Scan(
-        &newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
-    )
+func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
+	var p NotifyPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.GroupKey == "" || p.EventType == "" {
+		http.Error(w, "group_key dan event_type wajib ada", http.StatusBadRequest)
+		return
+	}
 
-    if err != nil {
-        http.Error(w, "gagal menyimpan laporan: "+err.Error(), 500)
-        return
-    }
+	ctx := r.Context()
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, "gagal memulai transaksi: "+err.Error(), 500)
+		return
+	}
+	defer tx.Rollback(ctx)
 
-    writeJSON(w, http.StatusCreated, newLaporan)
-}
+	// Logika "Upsert" untuk User berdasarkan nama
+	var ownerID *int64
+	if p.OwnerName != "" {
+		var id int64
+		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE name = $1", p.OwnerName).Scan(&id)
+		if err != nil {
+			if err == pgx.ErrNoRows { // Jika user tidak ada, buat baru
+				err = tx.QueryRow(ctx, "INSERT INTO users (name) VALUES ($1) RETURNING id", p.OwnerName).Scan(&id)
+				if err != nil {
+					http.Error(w, "gagal membuat user baru: "+err.Error(), 500)
+					return
+				}
+				log.Printf("User baru '%s' dibuat dengan ID %d", p.OwnerName, id)
+			} else { // Error lain
+				http.Error(w, "gagal mencari user: "+err.Error(), 500)
+				return
+			}
+		}
+		ownerID = &id
+	}
 
-func (s *Server) handleGetLaporan(w http.ResponseWriter, r *http.Request) {
-    ctx := r.Context()
-    rows, err := s.DB.Query(ctx, `
-        SELECT id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
-        FROM laporan ORDER BY waktu_laporan DESC LIMIT 50
-    `)
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer rows.Close()
+	var incidentID int64
+	var currentStatus string
+	err = tx.QueryRow(ctx, "SELECT id, status FROM cctv_incidents WHERE group_key=$1 FOR UPDATE", p.GroupKey).Scan(&incidentID, &currentStatus)
 
-    laporans := []Laporan{}
-    for rows.Next() {
-        var l Laporan
-        if err := rows.Scan(&l.ID, &l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi, &l.GambarBarangB64, &l.Status, &l.LaporanPasanganID, &l.WaktuLaporan, &l.UpdatedAt); err != nil {
-            http.Error(w, err.Error(), 500)
-            return
-        }
-        laporans = append(laporans, l)
-    }
+	if err != nil { // Insiden belum ada
+		newStatus := "created"
+		if p.EventType == "attended" {
+			newStatus = "attended"
+		} else if p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else {
+			http.Error(w, "event pertama harus 'attended' atau 'unattended'", http.StatusBadRequest)
+			return
+		}
+		err = tx.QueryRow(ctx, `
+            INSERT INTO cctv_incidents (group_key, owner_id, item_name, status, last_snapshot_b64)
+            VALUES ($1, $2, $3, $4, $5) RETURNING id
+        `, p.GroupKey, ownerID, nullify(p.ItemName), newStatus, nullify(p.SnapshotB64)).Scan(&incidentID)
+		if err != nil {
+			http.Error(w, "gagal buat insiden baru: "+err.Error(), 500)
+			return
+		}
 
-    writeJSON(w, http.StatusOK, laporans)
-}
+	} else { // Insiden sudah ada
+		newStatus := currentStatus
+		if currentStatus == "attended" && p.EventType == "unattended" {
+			newStatus = "unattended"
+		} else if currentStatus == "unattended" && p.EventType == "item_taken_by_other" {
+			newStatus = "taken"
+		}
 
-func (s *Server) handleGetDetailLaporan(w http.ResponseWriter, r *http.Request) {
-    id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-    if id == 0 {
-        http.Error(w, "ID laporan tidak valid", 400)
-        return
-    }
+		query := "UPDATE cctv_incidents SET updated_at=now()"
+		args := []interface{}{}
+		argID := 1
 
-    ctx := r.Context()
-    var l Laporan
-    err := s.DB.QueryRow(ctx, `
-        SELECT id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
-        FROM laporan WHERE id=$1
-    `, id).Scan(&l.ID, &l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi, &l.GambarBarangB64, &l.Status, &l.LaporanPasanganID, &l.WaktuLaporan, &l.UpdatedAt)
-    if err != nil {
-        http.Error(w, "laporan tidak ditemukan", 404)
-        return
-    }
+		if newStatus != currentStatus {
+			query += ", status=$" + strconv.Itoa(argID)
+			args = append(args, newStatus)
+			argID++
+		}
+		if p.SnapshotB64 != "" {
+			query += ", last_snapshot_b64=$" + strconv.Itoa(argID)
+			args = append(args, p.SnapshotB64)
+			argID++
+		}
+		if ownerID != nil {
+			query += ", owner_id=$" + strconv.Itoa(argID)
+			args = append(args, *ownerID)
+			argID++
+		}
 
-    rows, err := s.DB.Query(ctx, `SELECT id, laporan_id, sender, message, created_at FROM chat_messages WHERE laporan_id=$1 ORDER BY created_at ASC`, id)
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer rows.Close()
+		query += " WHERE id=$" + strconv.Itoa(argID)
+		args = append(args, incidentID)
 
-    chatHistory := []ChatMessage{}
-    for rows.Next() {
-        var msg ChatMessage
-        if err := rows.Scan(&msg.ID, &msg.LaporanID, &msg.Sender, &msg.Message, &msg.CreatedAt); err != nil {
-            http.Error(w, err.Error(), 500)
-            return
-        }
-        chatHistory = append(chatHistory, msg)
-    }
+		if len(args) > 1 {
+			_, err = tx.Exec(ctx, query, args...)
+			if err != nil {
+				http.Error(w, "gagal update insiden: "+err.Error(), 500)
+				return
+			}
+		}
+	}
 
-    writeJSON(w, http.StatusOK, map[string]any{
-        "laporan":       l,
-        "log_aktivitas": chatHistory,
-    })
-}
+	finalMessage := p.Message
+	if finalMessage == "" {
+		finalMessage = p.EventType
+	}
+	_, err = tx.Exec(ctx, `
+        INSERT INTO cctv_events (incident_id, event_type, message, occurred_at) VALUES ($1, $2, $3, $4)
+    `, incidentID, p.EventType, finalMessage, p.Timestamp)
+	if err != nil {
+		http.Error(w, "gagal catat event: "+err.Error(), 500)
+		return
+	}
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-    laporanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-    if laporanID == 0 {
-        http.Error(w, "id laporan tidak valid", 400)
-        return
-    }
-
-    ctx := r.Context()
-    var p ChatPayload
-    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-        http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-        return
-    }
-    if strings.TrimSpace(p.Message) == "" && p.ImageB64 == "" {
-        http.Error(w, "pesan atau gambar tidak boleh kosong", http.StatusBadRequest)
-        return
-    }
-
-    userMessage := p.Message
-    if p.ImageB64 != "" {
-        userMessage = strings.TrimSpace(userMessage + " [pengguna melampirkan sebuah gambar]")
-    }
-    _, err := s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
-    if err != nil {
-        http.Error(w, "gagal simpan pesan user: "+err.Error(), 500)
-        return
-    }
-
-    promptParts, err := s.buildAdvancedChatPrompt(ctx, laporanID, p.Message, p.ImageB64)
-    if err != nil {
-        http.Error(w, "gagal bangun prompt: "+err.Error(), 500)
-        return
-    }
-
-    resp, err := s.Gemini.GenerateContent(ctx, promptParts...)
-    if err != nil {
-        log.Printf("Error Gemini API: %v", err)
-        http.Error(w, "gagal komunikasi dengan AI: "+err.Error(), 502)
-        return
-    }
-
-    aiMessageText := extractTextFromResponse(resp)
-    if aiMessageText == "" {
-        aiMessageText = "Maaf, saya tidak bisa memberikan balasan saat ini."
-    }
-
-    var newAiMsg ChatMessage
-    err = s.DB.QueryRow(ctx,
-        `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'ai', $2) 
-         RETURNING id, laporan_id, sender, message, created_at`,
-        laporanID, aiMessageText,
-    ).Scan(&newAiMsg.ID, &newAiMsg.LaporanID, &newAiMsg.Sender, &newAiMsg.Message, &newAiMsg.CreatedAt)
-    if err != nil {
-        http.Error(w, "gagal simpan pesan AI: "+err.Error(), 500)
-        return
-    }
-
-    matchID := findReportIDInText(aiMessageText)
-    if matchID > 0 {
-        attachedLaporan, err := s.fetchLaporanByID(ctx, matchID)
-        if err == nil {
-            newAiMsg.AttachmentLaporan = attachedLaporan
-        }
-    }
-
-    writeJSON(w, http.StatusCreated, newAiMsg)
-}
-
-func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string) ([]genai.Part, error) {
-    var parts []genai.Part
-    var b strings.Builder
-
-    b.WriteString("Anda adalah Akai, asisten AI spesialis Lost & Found yang cerdas dan proaktif. Aturan Anda:\n")
-    b.WriteString("1. Analisis pesan & gambar baru dari pengguna.\n")
-    b.WriteString("2. Bandingkan detail laporan saat ini dengan laporan lain di 'Konteks Tambahan'.\n")
-    b.WriteString("3. Jika ada kemungkinan KECOCOKAN (match), beritahu pengguna dengan format WAJIB: 'Saya menemukan kemungkinan kecocokan dengan laporan #${ID_LAPORAN_MATCH}. Berikut detailnya...'. Jangan gunakan format lain.\n")
-    b.WriteString("4. Jika tidak ada match, balas pertanyaan pengguna secara normal dan ramah.\n\n")
-
-    var l Laporan
-    err := s.DB.QueryRow(ctx, `SELECT jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi FROM laporan WHERE id=$1`, laporanID).Scan(
-        &l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi)
-    if err != nil {
-        return nil, err
-    }
-
-    b.WriteString(fmt.Sprintf("--- LAPORAN UTAMA (ID: %d) ---\n", laporanID))
-    b.WriteString(fmt.Sprintf("- Jenis: %s\n- Pelapor: %s\n- Barang: %s\n- Deskripsi: %s\n\n", l.JenisLaporan, l.NamaPelapor, strFallback(l.NamaBarang, "N/A"), strFallback(l.Deskripsi, "N/A")))
-
-    jenisLaporanUntukDicari := "kehilangan"
-    if l.JenisLaporan == "kehilangan" {
-        jenisLaporanUntukDicari = "penemuan"
-    }
-
-    b.WriteString(fmt.Sprintf("--- KONTEKS TAMBAHAN: 5 LAPORAN '%s' TERBARU ---\n", jenisLaporanUntukDicari))
-    matchRows, _ := s.DB.Query(ctx,
-        `SELECT id, nama_barang, deskripsi, lokasi, gambar_barang_b64 FROM laporan WHERE jenis_laporan=$1 AND status='terbuka' ORDER BY waktu_laporan DESC LIMIT 5`,
-        jenisLaporanUntukDicari)
-
-    foundMatches := false
-    for matchRows.Next() {
-        foundMatches = true
-        var m struct {
-            ID                            int64
-            NamaBarang, Deskripsi, Lokasi *string
-            GambarB64                     *string
-        }
-        if err := matchRows.Scan(&m.ID, &m.NamaBarang, &m.Deskripsi, &m.Lokasi, &m.GambarB64); err == nil {
-            b.WriteString(fmt.Sprintf("- Laporan #%d: Barang: %s, Deskripsi: %s.", m.ID, strFallback(m.NamaBarang, "?"), strFallback(m.Deskripsi, "?")))
-            if m.GambarB64 != nil && *m.GambarB64 != "" {
-                b.WriteString(" [ADA GAMBAR]\n")
-            } else {
-                b.WriteString(" [TIDAK ADA GAMBAR]\n")
-            }
-        }
-    }
-    if !foundMatches {
-        b.WriteString("Tidak ada laporan relevan yang ditemukan saat ini.\n")
-    }
-    b.WriteString("\n")
-
-    b.WriteString("--- PESAN BARU DARI PENGGUNA ---\n")
-    b.WriteString(newUserMessage + "\n\n---\n")
-    b.WriteString("Tugas Anda: Berikan balasan sebagai Akai berdasarkan semua data di atas.")
-
-    parts = append(parts, genai.Text(b.String()))
-    if newUserImageB64 != "" {
-        imgBytes, err := base64.StdEncoding.DecodeString(newUserImageB64)
-        if err == nil {
-            parts = append(parts, genai.ImageData("jpeg", imgBytes))
-        }
-    }
-    return parts, nil
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, "gagal commit transaksi: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "incident_id": strconv.FormatInt(incidentID, 10)})
 }
 
 func (s *Server) handleGetIncidents(w http.ResponseWriter, r *http.Request) {
-    ctx := r.Context()
-    rows, err := s.DB.Query(ctx, "SELECT id, group_key, owner_name, item_name, status, created_at, updated_at, laporan_terkait_id FROM cctv_incidents ORDER BY updated_at DESC")
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer rows.Close()
+	ctx := r.Context()
+	rows, err := s.DB.Query(ctx, `
+		SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.laporan_terkait_id 
+		FROM cctv_incidents i
+		LEFT JOIN users u ON i.owner_id = u.id
+		ORDER BY i.updated_at DESC
+	`)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
 
-    incidents := []CCTVIncident{}
-    for rows.Next() {
-        var i CCTVIncident
-        if err := rows.Scan(&i.ID, &i.GroupKey, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LaporanTerkaitID); err != nil {
-            http.Error(w, err.Error(), 500)
-            return
-        }
-        incidents = append(incidents, i)
-    }
-    writeJSON(w, http.StatusOK, incidents)
+	incidents := []CCTVIncident{}
+	for rows.Next() {
+		var i CCTVIncident
+		if err := rows.Scan(&i.ID, &i.GroupKey, &i.OwnerID, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LaporanTerkaitID); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		incidents = append(incidents, i)
+	}
+	writeJSON(w, http.StatusOK, incidents)
 }
 
 func (s *Server) handleGetIncidentDetail(w http.ResponseWriter, r *http.Request) {
-    id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-    if id == 0 {
-        http.Error(w, "ID insiden tidak valid", 400)
-        return
-    }
-    ctx := r.Context()
-    var incident CCTVIncident
-    err := s.DB.QueryRow(ctx, "SELECT id, group_key, owner_name, item_name, status, created_at, updated_at, last_snapshot_b64, laporan_terkait_id FROM cctv_incidents WHERE id=$1", id).Scan(
-        &incident.ID, &incident.GroupKey, &incident.OwnerName, &incident.ItemName, &incident.Status, &incident.CreatedAt, &incident.UpdatedAt, &incident.LastSnapshotB64, &incident.LaporanTerkaitID)
-    if err != nil {
-        http.Error(w, "insiden tidak ditemukan", 404)
-        return
-    }
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if id == 0 {
+		http.Error(w, "ID insiden tidak valid", 400)
+		return
+	}
+	ctx := r.Context()
+	var incident CCTVIncident
+	err := s.DB.QueryRow(ctx, `
+		SELECT i.id, i.group_key, i.owner_id, u.name as owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
+		FROM cctv_incidents i
+		LEFT JOIN users u ON i.owner_id = u.id
+		WHERE i.id=$1
+	`, id).Scan(
+		&incident.ID, &incident.GroupKey, &incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.Status, &incident.CreatedAt, &incident.UpdatedAt, &incident.LastSnapshotB64, &incident.LaporanTerkaitID)
+	if err != nil {
+		http.Error(w, "insiden tidak ditemukan: "+err.Error(), 404)
+		return
+	}
 
-    rows, err := s.DB.Query(ctx, "SELECT id, incident_id, event_type, message, occurred_at FROM cctv_events WHERE incident_id=$1 ORDER BY occurred_at ASC", id)
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer rows.Close()
+	rows, err := s.DB.Query(ctx, "SELECT id, incident_id, event_type, message, occurred_at FROM cctv_events WHERE incident_id=$1 ORDER BY occurred_at ASC", id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
 
-    events := []CCTVEvent{}
-    for rows.Next() {
-        var e CCTVEvent
-        if err := rows.Scan(&e.ID, &e.IncidentID, &e.EventType, &e.Message, &e.OccurredAt); err != nil {
-            http.Error(w, err.Error(), 500)
-            return
-        }
-        events = append(events, e)
-    }
+	events := []CCTVEvent{}
+	for rows.Next() {
+		var e CCTVEvent
+		if err := rows.Scan(&e.ID, &e.IncidentID, &e.EventType, &e.Message, &e.OccurredAt); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		events = append(events, e)
+	}
 
-    writeJSON(w, http.StatusOK, map[string]any{
-        "incident": incident,
-        "events":   events,
-    })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"incident": incident,
+		"events":   events,
+	})
 }
 
 func (s *Server) handleCreateReportFromIncident(w http.ResponseWriter, r *http.Request) {
-    incidentID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-    if incidentID == 0 {
-        http.Error(w, "ID insiden tidak valid", 400)
-        return
-    }
+	incidentID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if incidentID == 0 {
+		http.Error(w, "ID insiden tidak valid", 400)
+		return
+	}
+	ctx := r.Context()
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer tx.Rollback(ctx)
 
-    ctx := r.Context()
-    tx, err := s.DB.Begin(ctx)
-    if err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-    defer tx.Rollback(ctx)
+	var incident CCTVIncident
+	err = tx.QueryRow(ctx, `
+		SELECT i.owner_id, u.name as owner_name, i.item_name, i.last_snapshot_b64, i.status
+		FROM cctv_incidents i
+		LEFT JOIN users u ON i.owner_id = u.id
+		WHERE i.id=$1
+	`, incidentID).Scan(
+		&incident.OwnerID, &incident.OwnerName, &incident.ItemName, &incident.LastSnapshotB64, &incident.Status)
+	if err != nil {
+		http.Error(w, "insiden tidak ditemukan", 404)
+		return
+	}
+	if incident.Status != "taken" {
+		http.Error(w, "hanya insiden dengan status 'taken' (Hilang) yang bisa dibuat laporan", http.StatusBadRequest)
+		return
+	}
 
-    var incident CCTVIncident
-    err = tx.QueryRow(ctx, "SELECT owner_name, item_name, last_snapshot_b64, status FROM cctv_incidents WHERE id=$1", incidentID).Scan(
-        &incident.OwnerName, &incident.ItemName, &incident.LastSnapshotB64, &incident.Status)
-    if err != nil {
-        http.Error(w, "insiden tidak ditemukan", 404)
-        return
-    }
-
-    if incident.Status != "taken" {
-        http.Error(w, "hanya insiden dengan status 'taken' (Hilang) yang bisa dibuat laporan", http.StatusBadRequest)
-        return
-    }
-
-    var newLaporan Laporan
-    err = tx.QueryRow(ctx, `
+	var newLaporan Laporan
+	err = tx.QueryRow(ctx, `
         INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64)
         VALUES ('kehilangan', $1, $2, $3, $4, $5)
         RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, waktu_laporan, updated_at
     `,
-        incident.OwnerName, incident.ItemName, "Barang hilang terdeteksi oleh CCTV", "Lokasi terakhir dari CCTV", incident.LastSnapshotB64,
-    ).Scan(&newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt)
-    if err != nil {
-        http.Error(w, "gagal membuat laporan baru: "+err.Error(), 500)
-        return
-    }
+		strFallback(incident.OwnerName, "Sistem CCTV"), incident.ItemName, "Barang hilang terdeteksi oleh CCTV", "Lokasi terakhir dari CCTV", incident.LastSnapshotB64,
+	).Scan(&newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt)
+	if err != nil {
+		http.Error(w, "gagal membuat laporan baru: "+err.Error(), 500)
+		return
+	}
 
-    _, err = tx.Exec(ctx, "UPDATE cctv_incidents SET laporan_terkait_id=$1 WHERE id=$2", newLaporan.ID, incidentID)
-    if err != nil {
-        http.Error(w, "gagal menautkan insiden ke laporan: "+err.Error(), 500)
-        return
-    }
+	_, err = tx.Exec(ctx, "UPDATE cctv_incidents SET laporan_terkait_id=$1 WHERE id=$2", newLaporan.ID, incidentID)
+	if err != nil {
+		http.Error(w, "gagal menautkan insiden ke laporan: "+err.Error(), 500)
+		return
+	}
 
-    if err := tx.Commit(ctx); err != nil {
-        http.Error(w, err.Error(), 500)
-        return
-    }
-
-    writeJSON(w, http.StatusCreated, newLaporan)
+	if err := tx.Commit(ctx); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusCreated, newLaporan)
 }
 
 func (s *Server) handleUpdateIncidentStatus(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPut {
-        http.Error(w, "Method tidak diizinkan", http.StatusMethodNotAllowed)
-        return
-    }
-
-    incidentID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-    if incidentID == 0 {
-        http.Error(w, "ID insiden tidak valid", 400)
-        return
-    }
-
-    var p StatusUpdatePayload
-    if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-        http.Error(w, "Payload tidak valid: "+err.Error(), http.StatusBadRequest)
-        return
-    }
-
-    validStatuses := map[string]bool{
-        "resolved_owner":   true,
-        "resolved_secured": true,
-    }
-    if !validStatuses[p.Status] {
-        http.Error(w, "Nilai status tidak valid", http.StatusBadRequest)
-        return
-    }
-
-    ctx := r.Context()
-    cmdTag, err := s.DB.Exec(ctx,
-        "UPDATE cctv_incidents SET status=$1, updated_at=now() WHERE id=$2",
-        p.Status, incidentID,
-    )
-
-    if err != nil {
-        http.Error(w, "Gagal update status: "+err.Error(), 500)
-        return
-    }
-    if cmdTag.RowsAffected() == 0 {
-        http.Error(w, "Insiden tidak ditemukan", 404)
-        return
-    }
-
-    updatedIncident, err := s.fetchIncidentByID(ctx, incidentID)
-    if err != nil {
-        http.Error(w, "Gagal mengambil data terbaru: "+err.Error(), 500)
-        return
-    }
-
-    writeJSON(w, http.StatusOK, updatedIncident)
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+	incidentID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if incidentID == 0 {
+		http.Error(w, "ID insiden tidak valid", 400)
+		return
+	}
+	var p StatusUpdatePayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Payload tidak valid: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	validStatuses := map[string]bool{
+		"resolved_owner":   true,
+		"resolved_secured": true,
+	}
+	if !validStatuses[p.Status] {
+		http.Error(w, "Nilai status tidak valid", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	cmdTag, err := s.DB.Exec(ctx,
+		"UPDATE cctv_incidents SET status=$1, updated_at=now() WHERE id=$2",
+		p.Status, incidentID,
+	)
+	if err != nil {
+		http.Error(w, "Gagal update status: "+err.Error(), 500)
+		return
+	}
+	if cmdTag.RowsAffected() == 0 {
+		http.Error(w, "Insiden tidak ditemukan", 404)
+		return
+	}
+	updatedIncident, err := s.fetchIncidentByID(ctx, incidentID) // Helper function
+	if err != nil {
+		http.Error(w, "Gagal mengambil data terbaru: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusOK, updatedIncident)
 }
 
-// ---- Helper Functions ----
+// ----- Handler User -----
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var p UserPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.Name == "" {
+		http.Error(w, "nama wajib diisi", http.StatusBadRequest)
+		return
+	}
+
+	var newUser User
+	ctx := r.Context()
+	err := s.DB.QueryRow(ctx, `
+		INSERT INTO users (name) VALUES ($1)
+		ON CONFLICT (name) DO NOTHING
+		RETURNING id, name, created_at
+	`, p.Name).Scan(&newUser.ID, &newUser.Name, &newUser.CreatedAt)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, "user dengan nama tersebut sudah ada", http.StatusConflict)
+			return
+		}
+		http.Error(w, "gagal menyimpan user: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusCreated, newUser)
+}
+
+func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	rows, err := s.DB.Query(ctx, "SELECT id, name, created_at FROM users ORDER BY name ASC")
+	if err != nil {
+		http.Error(w, "gagal mengambil data user: "+err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	users := []User{}
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Name, &u.CreatedAt); err != nil {
+			http.Error(w, "gagal scan data user: "+err.Error(), 500)
+			return
+		}
+		users = append(users, u)
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+// ----- Handler Laporan & Chat (Tidak Berubah) -----
+
+func (s *Server) handleBuatLaporan(w http.ResponseWriter, r *http.Request) {
+	var p LaporanPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.JenisLaporan == "" || p.NamaPelapor == "" || p.NamaBarang == "" {
+		http.Error(w, "jenis_laporan, nama_pelapor, dan nama_barang wajib diisi", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	var newLaporan Laporan
+	err := s.DB.QueryRow(ctx, `
+        INSERT INTO laporan (jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
+    `, p.JenisLaporan, p.NamaPelapor, p.NamaBarang, p.Deskripsi, p.Lokasi, nullify(p.GambarBarangB64)).Scan(
+		&newLaporan.ID, &newLaporan.JenisLaporan, &newLaporan.NamaPelapor, &newLaporan.NamaBarang, &newLaporan.Deskripsi, &newLaporan.Lokasi, &newLaporan.GambarBarangB64, &newLaporan.Status, &newLaporan.LaporanPasanganID, &newLaporan.WaktuLaporan, &newLaporan.UpdatedAt,
+	)
+
+	if err != nil {
+		http.Error(w, "gagal menyimpan laporan: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, http.StatusCreated, newLaporan)
+}
+
+func (s *Server) handleGetLaporan(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	rows, err := s.DB.Query(ctx, `
+        SELECT id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
+        FROM laporan ORDER BY waktu_laporan DESC LIMIT 50
+    `)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	laporans := []Laporan{}
+	for rows.Next() {
+		var l Laporan
+		if err := rows.Scan(&l.ID, &l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi, &l.GambarBarangB64, &l.Status, &l.LaporanPasanganID, &l.WaktuLaporan, &l.UpdatedAt); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		laporans = append(laporans, l)
+	}
+	writeJSON(w, http.StatusOK, laporans)
+}
+
+func (s *Server) handleGetDetailLaporan(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if id == 0 {
+		http.Error(w, "ID laporan tidak valid", 400)
+		return
+	}
+
+	ctx := r.Context()
+	var l Laporan
+	err := s.DB.QueryRow(ctx, `
+        SELECT id, jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi, gambar_barang_b64, status, laporan_pasangan_id, waktu_laporan, updated_at
+        FROM laporan WHERE id=$1
+    `, id).Scan(&l.ID, &l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi, &l.GambarBarangB64, &l.Status, &l.LaporanPasanganID, &l.WaktuLaporan, &l.UpdatedAt)
+	if err != nil {
+		http.Error(w, "laporan tidak ditemukan", 404)
+		return
+	}
+
+	rows, err := s.DB.Query(ctx, `SELECT id, laporan_id, sender, message, created_at FROM chat_messages WHERE laporan_id=$1 ORDER BY created_at ASC`, id)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer rows.Close()
+
+	chatHistory := []ChatMessage{}
+	for rows.Next() {
+		var msg ChatMessage
+		if err := rows.Scan(&msg.ID, &msg.LaporanID, &msg.Sender, &msg.Message, &msg.CreatedAt); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		chatHistory = append(chatHistory, msg)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"laporan":       l,
+		"log_aktivitas": chatHistory,
+	})
+}
+
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	laporanID, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if laporanID == 0 {
+		http.Error(w, "id laporan tidak valid", 400)
+		return
+	}
+
+	ctx := r.Context()
+	var p ChatPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(p.Message) == "" && p.ImageB64 == "" {
+		http.Error(w, "pesan atau gambar tidak boleh kosong", http.StatusBadRequest)
+		return
+	}
+
+	userMessage := p.Message
+	if p.ImageB64 != "" {
+		userMessage = strings.TrimSpace(userMessage + " [pengguna melampirkan sebuah gambar]")
+	}
+	_, err := s.DB.Exec(ctx, `INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'user', $2)`, laporanID, userMessage)
+	if err != nil {
+		http.Error(w, "gagal simpan pesan user: "+err.Error(), 500)
+		return
+	}
+
+	promptParts, err := s.buildAdvancedChatPrompt(ctx, laporanID, p.Message, p.ImageB64)
+	if err != nil {
+		http.Error(w, "gagal bangun prompt: "+err.Error(), 500)
+		return
+	}
+
+	resp, err := s.Gemini.GenerateContent(ctx, promptParts...)
+	if err != nil {
+		log.Printf("Error Gemini API: %v", err)
+		http.Error(w, "gagal komunikasi dengan AI: "+err.Error(), 502)
+		return
+	}
+
+	aiMessageText := extractTextFromResponse(resp)
+	if aiMessageText == "" {
+		aiMessageText = "Maaf, saya tidak bisa memberikan balasan saat ini."
+	}
+
+	var newAiMsg ChatMessage
+	err = s.DB.QueryRow(ctx,
+		`INSERT INTO chat_messages (laporan_id, sender, message) VALUES ($1, 'ai', $2) 
+         RETURNING id, laporan_id, sender, message, created_at`,
+		laporanID, aiMessageText,
+	).Scan(&newAiMsg.ID, &newAiMsg.LaporanID, &newAiMsg.Sender, &newAiMsg.Message, &newAiMsg.CreatedAt)
+	if err != nil {
+		http.Error(w, "gagal simpan pesan AI: "+err.Error(), 500)
+		return
+	}
+
+	matchID := findReportIDInText(aiMessageText)
+	if matchID > 0 {
+		attachedLaporan, err := s.fetchLaporanByID(ctx, matchID)
+		if err == nil {
+			newAiMsg.AttachmentLaporan = attachedLaporan
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, newAiMsg)
+}
+
+func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string) ([]genai.Part, error) {
+	// ... (Fungsi ini tidak berubah)
+	var parts []genai.Part
+	var b strings.Builder
+
+	b.WriteString("Anda adalah Akai, asisten AI spesialis Lost & Found yang cerdas dan proaktif. Aturan Anda:\n")
+	b.WriteString("1. Analisis pesan & gambar baru dari pengguna.\n")
+	b.WriteString("2. Bandingkan detail laporan saat ini dengan laporan lain di 'Konteks Tambahan'.\n")
+	b.WriteString("3. Jika ada kemungkinan KECOCOKAN (match), beritahu pengguna dengan format WAJIB: 'Saya menemukan kemungkinan kecocokan dengan laporan #${ID_LAPORAN_MATCH}. Berikut detailnya...'. Jangan gunakan format lain.\n")
+	b.WriteString("4. Jika tidak ada match, balas pertanyaan pengguna secara normal dan ramah.\n\n")
+
+	var l Laporan
+	err := s.DB.QueryRow(ctx, `SELECT jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi FROM laporan WHERE id=$1`, laporanID).Scan(
+		&l.JenisLaporan, &l.NamaPelapor, &l.NamaBarang, &l.Deskripsi, &l.Lokasi)
+	if err != nil {
+		return nil, err
+	}
+
+	b.WriteString(fmt.Sprintf("--- LAPORAN UTAMA (ID: %d) ---\n", laporanID))
+	b.WriteString(fmt.Sprintf("- Jenis: %s\n- Pelapor: %s\n- Barang: %s\n- Deskripsi: %s\n\n", l.JenisLaporan, l.NamaPelapor, strFallback(l.NamaBarang, "N/A"), strFallback(l.Deskripsi, "N/A")))
+
+	jenisLaporanUntukDicari := "kehilangan"
+	if l.JenisLaporan == "kehilangan" {
+		jenisLaporanUntukDicari = "penemuan"
+	}
+
+	b.WriteString(fmt.Sprintf("--- KONTEKS TAMBAHAN: 5 LAPORAN '%s' TERBARU ---\n", jenisLaporanUntukDicari))
+	matchRows, _ := s.DB.Query(ctx,
+		`SELECT id, nama_barang, deskripsi, lokasi, gambar_barang_b64 FROM laporan WHERE jenis_laporan=$1 AND status='terbuka' ORDER BY waktu_laporan DESC LIMIT 5`,
+		jenisLaporanUntukDicari)
+
+	foundMatches := false
+	for matchRows.Next() {
+		foundMatches = true
+		var m struct {
+			ID                            int64
+			NamaBarang, Deskripsi, Lokasi *string
+			GambarB64                     *string
+		}
+		if err := matchRows.Scan(&m.ID, &m.NamaBarang, &m.Deskripsi, &m.Lokasi, &m.GambarB64); err == nil {
+			b.WriteString(fmt.Sprintf("- Laporan #%d: Barang: %s, Deskripsi: %s.", m.ID, strFallback(m.NamaBarang, "?"), strFallback(m.Deskripsi, "?")))
+			if m.GambarB64 != nil && *m.GambarB64 != "" {
+				b.WriteString(" [ADA GAMBAR]\n")
+			} else {
+				b.WriteString(" [TIDAK ADA GAMBAR]\n")
+			}
+		}
+	}
+	if !foundMatches {
+		b.WriteString("Tidak ada laporan relevan yang ditemukan saat ini.\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("--- PESAN BARU DARI PENGGUNA ---\n")
+	b.WriteString(newUserMessage + "\n\n---\n")
+	b.WriteString("Tugas Anda: Berikan balasan sebagai Akai berdasarkan semua data di atas.")
+
+	parts = append(parts, genai.Text(b.String()))
+	if newUserImageB64 != "" {
+		imgBytes, err := base64.StdEncoding.DecodeString(newUserImageB64)
+		if err == nil {
+			parts = append(parts, genai.ImageData("jpeg", imgBytes))
+		}
+	}
+	return parts, nil
+}
+
+
+// ----- Helper Functions -----
 
 func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, error) {
 	var l Laporan
@@ -737,8 +841,13 @@ func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, erro
 
 func (s *Server) fetchIncidentByID(ctx context.Context, id int64) (*CCTVIncident, error) {
 	var i CCTVIncident
-	err := s.DB.QueryRow(ctx, "SELECT id, group_key, owner_name, item_name, status, created_at, updated_at, last_snapshot_b64, laporan_terkait_id FROM cctv_incidents WHERE id=$1", id).Scan(
-		&i.ID, &i.GroupKey, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LastSnapshotB64, &i.LaporanTerkaitID)
+	err := s.DB.QueryRow(ctx, `
+		SELECT i.id, i.group_key, i.owner_id, u.name AS owner_name, i.item_name, i.status, i.created_at, i.updated_at, i.last_snapshot_b64, i.laporan_terkait_id 
+		FROM cctv_incidents i
+		LEFT JOIN users u ON i.owner_id = u.id
+		WHERE i.id=$1
+	`, id).Scan(
+		&i.ID, &i.GroupKey, &i.OwnerID, &i.OwnerName, &i.ItemName, &i.Status, &i.CreatedAt, &i.UpdatedAt, &i.LastSnapshotB64, &i.LaporanTerkaitID)
 	if err != nil {
 		return nil, err
 	}
