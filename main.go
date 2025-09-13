@@ -95,8 +95,9 @@ type LaporanPayload struct {
 	GambarBarangB64 string `json:"gambar_barang_b64,omitempty"`
 }
 type ChatPayload struct {
-	Message  string `json:"message"`
-	ImageB64 string `json:"image_b64,omitempty"`
+    Message        string `json:"message"`
+    ImageB64       string `json:"image_b64,omitempty"`
+    CctvIncidentID *int64 `json:"cctv_incident_id,omitempty"` 
 }
 
 type NotifyPayload struct {
@@ -838,7 +839,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	promptParts, err := s.buildAdvancedChatPrompt(ctx, laporanID, p.Message, p.ImageB64)
+	promptParts, err := s.buildAdvancedChatPrompt(ctx, laporanID, p.Message, p.ImageB64, p.CctvIncidentID)
 	if err != nil {
 		http.Error(w, "gagal bangun prompt: "+err.Error(), 500)
 		return
@@ -877,15 +878,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, newAiMsg)
 }
-func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string) ([]genai.Part, error) {
+
+func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, newUserMessage string, newUserImageB64 string, cctvIncidentID *int64) ([]genai.Part, error) {
 	var parts []genai.Part
 	var b strings.Builder
 
-	b.WriteString("Anda adalah Akai, asisten AI spesialis Lost & Found yang cerdas dan proaktif. Aturan Anda:\n")
-	b.WriteString("1. Analisis pesan & gambar baru dari pengguna.\n")
-	b.WriteString("2. Bandingkan detail laporan saat ini dengan laporan lain di 'Konteks Tambahan'.\n")
-	b.WriteString("3. Jika ada kemungkinan KECOCOKAN (match), beritahu pengguna dengan format WAJIB: 'Saya menemukan kemungkinan kecocokan dengan laporan #${ID_LAPORAN_MATCH}. Berikut detailnya...'. Jangan gunakan format lain.\n")
-	b.WriteString("4. Jika tidak ada match, balas pertanyaan pengguna secara normal dan ramah.\n\n")
+	b.WriteString("Anda adalah Akai, asisten AI spesialis Lost & Found yang cerdas dan proaktif.\n")
+
+	// --- LOGIKA BARU: Cek jika ada konteks dari CCTV ---
+	if cctvIncidentID != nil {
+		var incident struct {
+			ItemName          *string
+			LastKnownLocation *string
+			CreatedAt         time.Time
+		}
+		err := s.DB.QueryRow(ctx,
+			"SELECT item_name, last_known_location, created_at FROM cctv_incidents WHERE id=$1",
+			*cctvIncidentID).Scan(&incident.ItemName, &incident.LastKnownLocation, &incident.CreatedAt)
+
+		if err == nil {
+			b.WriteString("--- KONTEKS DARI CCTV ---\n")
+			b.WriteString("Pengguna melaporkan kehilangan barang yang sudah terdeteksi oleh sistem CCTV.\n")
+			b.WriteString(fmt.Sprintf("- Barang yang Hilang: %s\n", strFallback(incident.ItemName, "Belum teridentifikasi")))
+			b.WriteString(fmt.Sprintf("- Lokasi Terakhir: %s\n", strFallback(incident.LastKnownLocation, "Tidak diketahui")))
+			b.WriteString(fmt.Sprintf("- Waktu Terdeteksi: %s\n", incident.CreatedAt.Format(time.RFC1123)))
+			b.WriteString("Tugas Anda: JANGAN bertanya lagi tentang nama barang, lokasi, atau waktu. Gunakan informasi ini untuk LANGSUNG membuat laporan kehilangan. Beri konfirmasi ke pengguna bahwa laporan berdasarkan data CCTV telah dibuat dan tanyakan detail tambahan seperti 'warna' atau 'merek' jika diperlukan.\n\n")
+		}
+	}
+
+	b.WriteString("--- ATURAN UMUM ---\n")
+	b.WriteString("1. Jika pengguna melaporkan PENEMUAN, tanyakan detail barang, lokasi, dan waktu ditemukan.\n")
+	b.WriteString("2. Jika pengguna melaporkan KEHILANGAN tanpa konteks CCTV, tanyakan detailnya.\n")
+	b.WriteString("3. Jika setelah mendapat detail, Anda menemukan KECOCOKAN dengan laporan lain di 'Konteks Tambahan', beritahu pengguna dengan format: 'Saya menemukan kemungkinan kecocokan dengan laporan #${ID_LAPORAN_MATCH}.'\n")
+	b.WriteString("4. Selalu balas dengan ramah.\n\n")
 
 	var l Laporan
 	err := s.DB.QueryRow(ctx, `SELECT jenis_laporan, nama_pelapor, nama_barang, deskripsi, lokasi FROM laporan WHERE id=$1`, laporanID).Scan(
@@ -894,44 +919,34 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
 		return nil, err
 	}
 
-	b.WriteString(fmt.Sprintf("--- LAPORAN UTAMA (ID: %d) ---\n", laporanID))
-	b.WriteString(fmt.Sprintf("- Jenis: %s\n- Pelapor: %s\n- Barang: %s\n- Deskripsi: %s\n\n", l.JenisLaporan, l.NamaPelapor, strFallback(l.NamaBarang, "N/A"), strFallback(l.Deskripsi, "N/A")))
+	b.WriteString(fmt.Sprintf("--- LAPORAN CHAT SAAT INI (ID: %d) ---\n", laporanID))
+	b.WriteString(fmt.Sprintf("- Jenis: %s\n- Pelapor: %s\n\n", l.JenisLaporan, l.NamaPelapor))
 
-	jenisLaporanUntukDicari := "kehilangan"
-	if l.JenisLaporan == "kehilangan" {
-		jenisLaporanUntukDicari = "penemuan"
-	}
-
-	b.WriteString(fmt.Sprintf("--- KONTEKS TAMBAHAN: 5 LAPORAN '%s' TERBARU ---\n", jenisLaporanUntukDicari))
+	b.WriteString("--- KONTEKS TAMBAHAN: LAPORAN LAIN YANG RELEVAN ---\n")
 	matchRows, _ := s.DB.Query(ctx,
-		`SELECT id, nama_barang, deskripsi, lokasi, gambar_barang_b64 FROM laporan WHERE jenis_laporan=$1 AND status='terbuka' ORDER BY waktu_laporan DESC LIMIT 5`,
-		jenisLaporanUntukDicari)
-
+		`SELECT id, jenis_laporan, nama_barang, deskripsi, lokasi FROM laporan WHERE status='terbuka' AND id != $1 ORDER BY waktu_laporan DESC LIMIT 5`,
+		laporanID)
+	
 	foundMatches := false
+	defer matchRows.Close()
 	for matchRows.Next() {
 		foundMatches = true
 		var m struct {
 			ID                            int64
+			JenisLaporan                  string
 			NamaBarang, Deskripsi, Lokasi *string
-			GambarB64                     *string
 		}
-		if err := matchRows.Scan(&m.ID, &m.NamaBarang, &m.Deskripsi, &m.Lokasi, &m.GambarB64); err == nil {
-			b.WriteString(fmt.Sprintf("- Laporan #%d: Barang: %s, Deskripsi: %s.", m.ID, strFallback(m.NamaBarang, "?"), strFallback(m.Deskripsi, "?")))
-			if m.GambarB64 != nil && *m.GambarB64 != "" {
-				b.WriteString(" [ADA GAMBAR]\n")
-			} else {
-				b.WriteString(" [TIDAK ADA GAMBAR]\n")
-			}
+		if err := matchRows.Scan(&m.ID, &m.JenisLaporan, &m.NamaBarang, &m.Deskripsi, &m.Lokasi); err == nil {
+			b.WriteString(fmt.Sprintf("- Laporan #%d (%s): Barang: %s, Deskripsi: %s.\n", m.ID, m.JenisLaporan, strFallback(m.NamaBarang, "?"), strFallback(m.Deskripsi, "?")))
 		}
 	}
 	if !foundMatches {
-		b.WriteString("Tidak ada laporan relevan yang ditemukan saat ini.\n")
+		b.WriteString("Tidak ada laporan relevan lainnya saat ini.\n")
 	}
 	b.WriteString("\n")
 
 	b.WriteString("--- PESAN BARU DARI PENGGUNA ---\n")
-	b.WriteString(newUserMessage + "\n\n---\n")
-	b.WriteString("Tugas Anda: Berikan balasan sebagai Akai berdasarkan semua data di atas.")
+	b.WriteString(newUserMessage)
 
 	parts = append(parts, genai.Text(b.String()))
 	if newUserImageB64 != "" {
@@ -942,7 +957,6 @@ func (s *Server) buildAdvancedChatPrompt(ctx context.Context, laporanID int64, n
 	}
 	return parts, nil
 }
-
 // ----- Helper Functions -----
 
 func (s *Server) fetchLaporanByID(ctx context.Context, id int64) (*Laporan, error) {
