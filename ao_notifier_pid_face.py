@@ -115,43 +115,48 @@ def image_to_base64(path: str) -> Optional[str]:
         return None
 def notify_backend(
     group_key,
-    owner_pid,
+    owner_pid,  # owner_pid tidak dipakai di payload Go, tapi kita biarkan di signature
     owner_name,
     item_name,
     snap_type,
-    frame_path=None,  # Path masih diterima sebagai input
-    crop_path=None,   # Path masih diterima sebagai input
+    frame_path=None,
+    crop_path=None,
     message=None,
-    location=None,
-    meta=None,
+    location=None, # location juga tidak dipakai
+    meta=None,      # meta juga tidak dipakai
 ):
-    # UBAH DI SINI: Baca file dan encode ke base64
-    frame_data_b64 = image_to_base64(frame_path)
-    crop_data_b64 = image_to_base64(crop_path)
+    # Pilih data gambar mana yang mau dikirim. Go hanya menerima satu.
+    # Kita prioritaskan frame utuh, jika tidak ada baru crop.
+    image_data_b64 = image_to_base64(frame_path) or image_to_base64(crop_path)
 
+    # BUAT PAYLOAD SESUAI FORMAT GO
     payload = {
         "group_key": group_key,
-        "owner_pid": owner_pid,
+        "event_type": snap_type,  # Ganti nama dari 'type' -> 'event_type' dan pindahkan ke atas
         "owner_name": owner_name,
         "item_name": item_name,
-        "location": location,
-        "snapshot": {
-            "type": snap_type,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "frame_data": frame_data_b64,  # Kirim data base64
-            "crop_data": crop_data_b64,   # Kirim data base64
-            "message": message,
-            "meta": meta or {},
-        },
+        "message": message or "",
+        "snapshot_b64": image_data_b64, # Ganti nama -> 'snapshot_b64' dan pilih salah satu gambar
+        "timestamp": datetime.now(timezone.utc).isoformat() # Ganti nama dari 'ts' -> 'timestamp'
     }
 
     try:
-        r = requests.post(BACKEND_URL, json=payload, timeout=10) # Timeout ditambah
-        print(f"[NOTIFY] {snap_type} -> {r.status_code}")
+        # Hapus 'snapshot' dari URL, karena endpointnya hanya /notify
+        # URL yang benar sudah diatur di BACKEND_URL
+        r = requests.post(BACKEND_URL, json=payload, timeout=10)
+        
+        print(f"[NOTIFY] Mengirim event '{snap_type}' untuk '{group_key}' -> Status: {r.status_code}")
         if r.status_code >= 300:
-            print(f"[BACKEND] gagal kirim ({r.status_code}): {r.text}")
+            print(f"[BACKEND-ERROR] Gagal kirim ({r.status_code}): {r.text}")
+        else:
+            # Jika sukses, backend Go akan merespon dengan JSON
+            try:
+                print(f"[BACKEND-SUCCESS] Response: {r.json()}")
+            except requests.exceptions.JSONDecodeError:
+                print(f"[BACKEND-SUCCESS] Response: {r.text}")
+
     except Exception as e:
-        print(f"[NOTIFY-ERROR] {e}")
+        print(f"[NOTIFY-ERROR] Gagal mengirim request: {e}")
 
 # ---------- Utils ----------
 def is_person(name: str) -> bool:
