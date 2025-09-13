@@ -159,7 +159,7 @@ def analyze_location_with_gemini(frame_image_path: str) -> Optional[str]:
     """
     try:
         # Ganti dengan API Key Anda atau muat dari environment variable
-        api_key = os.getenv("GOOGLE_API_KEY", "AIzaSy...Anda") 
+        api_key = "AIzaSyDiMY2xY0N_eOw5vUzk-J3sLVDb81TEfS8"
         if not api_key:
             print("[GEMINI-ERROR] GOOGLE_API_KEY tidak ditemukan.")
             return None
@@ -649,7 +649,7 @@ def main():
                     continue
 
                 un_frame_path = os.path.join(pair_dir, f"UNATTENDED_{ts_un}_frame.jpg")
-                cv2.imwrite(un_frame_path, un_frame)
+                cv2.imwrite(un_frame_path, frame)
 
                 un_crop_path = os.path.join(pair_dir, f"UNATTENDED_{ts_un}_crop.jpg")
                 cv2.imwrite(un_crop_path, frame[y1:y2, x1:x2].copy())
