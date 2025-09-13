@@ -247,7 +247,7 @@ class FaceBank:
     Muat 1 foto per orang dari folder images/,
     filename tanpa ekstensi dipakai sebagai label (identity).
     """
-    def __init__(self, app: FaceAnalysis, folder="images"):
+    def __init__(self, app: FaceAnalysis, folder="data_face"):
         self.app = app
         self.folder = folder
         self.labels = []
@@ -310,7 +310,7 @@ class FaceMatcher:
         providers = ["CPUExecutionProvider"] if device == "cpu" else ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.app = FaceAnalysis(name="buffalo_l", providers=providers)
         self.app.prepare(ctx_id=0 if device != "cpu" else -1, det_size=(640, 640))
-        self.facebank = FaceBank(self.app, folder="images")
+        self.facebank = FaceBank(self.app, folder="data_face")
         self.sample_every = max(1, int(sample_every))
         self.bank_thresh = float(bank_thresh)
         self._tick = 0
@@ -688,16 +688,30 @@ def main():
                     message=f"Snapshot attended by {st['owner_name'] or 'Unknown'}"
                 )
                 save_index(index_path, index_db)
+                pair["unattended"].append({
+                    "timestamp": ts_un,
+                    "frame": os.path.relpath(un_frame_path, args.out_dir),
+                    "crop": os.path.relpath(un_crop_path, args.out_dir)
+                })
+
+                # ================= TAMBAHKAN DEBUG DI SINI =================
+                print("-" * 30)
+                print(f"DEBUG: Memanggil notify_backend untuk UNATTENDED")
+                print(f"DEBUG: Frame Path: {un_frame_path}, Exists: {os.path.exists(un_frame_path)}")
+                print(f"DEBUG: Crop Path: {un_crop_path}, Exists: {os.path.exists(un_crop_path)}")
+                print("-" * 30)
+                # =========================================================
+
                 notify_backend(
                     group_key=pair_key,
                     owner_pid=st["owner_pid"],
                     owner_name=st["owner_name"],
                     item_name=(gemini_result.get("nama_objek") if gemini_result else None),
                     snap_type="unattended",
-                    frame_path=os.path.relpath(un_frame_path, args.out_dir),
-                    crop_path=os.path.relpath(un_crop_path, args.out_dir),
+                    frame_path=un_frame_path, # Path masih dikirim ke fungsi
+                    crop_path=un_crop_path,   # Path masih dikirim ke fungsi
                     message="",
-                    location=None,   # isi kalau ada, mis: "kantin"
+                    location=None,
                     meta=None
                 )
 
