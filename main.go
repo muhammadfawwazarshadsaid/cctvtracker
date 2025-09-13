@@ -152,7 +152,7 @@ func main() {
 		log.Fatalf("Gagal membuat klien Gemini: %v", err)
 	}
 	defer geminiClient.Close()
-	geminiModel := geminiClient.GenerativeModel("gemini-1.5-flash")
+	geminiModel := geminiClient.GenerativeModel("gemini-2.5-flash-lite")
 
 	s := &Server{
 		DB:     pool,
