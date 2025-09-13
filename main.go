@@ -259,7 +259,6 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 	}
 	return nil
 }
-
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	var p NotifyPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -282,32 +281,49 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	var ownerID *int64
 	if p.OwnerName != "" {
 		var id int64
+		// Coba cari user berdasarkan nama
 		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE name = $1", p.OwnerName).Scan(&id)
+		
+		// Jika user tidak ditemukan, coba buat baru
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				defaultPassword := "12345678"
-				hashedPassword, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
-				if err != nil {
-					http.Error(w, "gagal hash password: "+err.Error(), 500)
-					return
-				}
+				hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
+				
 				safeName := strings.ReplaceAll(strings.ToLower(p.OwnerName), " ", "")
 				email := fmt.Sprintf("%s@track.ai", safeName)
-				err = tx.QueryRow(ctx, `
+
+				// Coba INSERT user baru
+				errInsert := tx.QueryRow(ctx, `
                     INSERT INTO users (name, email, password_hash)
                     VALUES ($1, $2, $3)
                     RETURNING id
                 `, p.OwnerName, email, string(hashedPassword)).Scan(&id)
-				if err != nil {
-					if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
-						http.Error(w, "user dengan email atau nama tersebut sudah ada: "+err.Error(), http.StatusConflict)
+
+				// --- PERUBAHAN LOGIKA DIMULAI DI SINI ---
+				if errInsert != nil {
+					// Jika INSERT gagal karena duplikat (baik nama atau email)
+					if strings.Contains(errInsert.Error(), "duplicate key value") {
+						log.Printf("Gagal insert user duplikat '%s', mencoba mencari ulang...", p.OwnerName)
+						// Coba cari lagi berdasarkan nama, karena mungkin sudah dibuat oleh proses lain
+						errSearchAgain := tx.QueryRow(ctx, "SELECT id FROM users WHERE name = $1", p.OwnerName).Scan(&id)
+						if errSearchAgain != nil {
+							http.Error(w, "gagal mencari user setelah gagal insert: "+errSearchAgain.Error(), 500)
+							return
+						}
+						log.Printf("User '%s' ditemukan dengan ID %d pada percobaan kedua.", p.OwnerName, id)
+					} else {
+						// Error lain saat insert
+						http.Error(w, "gagal membuat user baru secara otomatis: "+errInsert.Error(), 500)
 						return
 					}
-					http.Error(w, "gagal membuat user baru secara otomatis: "+err.Error(), 500)
-					return
+				} else {
+					log.Printf("Akun login baru untuk '%s' dibuat dengan email '%s' dan ID %d", p.OwnerName, email, id)
 				}
-				log.Printf("Akun login baru untuk '%s' dibuat dengan email '%s' dan ID %d", p.OwnerName, email, id)
+				// --- AKHIR PERUBAHAN LOGIKA ---
+
 			} else {
+				// Error lain saat SELECT awal
 				http.Error(w, "gagal mencari user: "+err.Error(), 500)
 				return
 			}
@@ -370,13 +386,11 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 			args = append(args, p.Location)
 			argID++
 		}
-		// --- INI BAGIAN YANG DIPERBAIKI ---
 		if p.ItemName != "" {
 			query += ", item_name=$" + strconv.Itoa(argID)
 			args = append(args, p.ItemName)
 			argID++
 		}
-		// --- AKHIR PERBAIKAN ---
 
 		query += " WHERE id=$" + strconv.Itoa(argID)
 		args = append(args, incidentID)
